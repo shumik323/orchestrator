@@ -97,7 +97,22 @@ log_generator_result "$run_dir" "$task_id" "$gen_out"
 log_event "$run_dir" "$task_id" implement finished \
   "$(jq -cn --arg rc "$gen_rc" '{exit_code: $rc}')"
 
-if [ -n "$(g -C "$work/repo" status --porcelain)" ]; then
+# Ошибка генератора не должна читаться как «править было нечего».
+# Живой прогон 22.08: упор в --max-budget-usd на 4-м ходу дал пустой диф,
+# и задача была помечена done — успех, за которым нет работы.
+gen_err="$(jq -r '
+  if (.is_error == true) or (((.subtype // "") | startswith("error")))
+  then (.subtype // "error") else empty end' "$gen_out" 2>/dev/null || true)"
+if [ -n "$gen_err" ]; then
+  log_event "$run_dir" "$task_id" implement failed \
+    "$(jq -cn --arg s "$gen_err" '{subtype: $s}')"
+  set_status "blocked"
+  printf 'генератор завершился ошибкой (%s) — задача blocked, каталог %s оставлен\n' \
+    "$gen_err" "$work" >&2
+  exit 1
+fi
+
+if [ -z "$(g -C "$work/repo" status --porcelain)" ]; then
   log_event "$run_dir" "$task_id" implement no-change
   set_status "done"
   printf 'правка не потребовалась — MR не создан\n'

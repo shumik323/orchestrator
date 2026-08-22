@@ -122,3 +122,21 @@ GEN
   git -c core.hooksPath="$TMP/nohooks" commit -qm no-hooks
   [ ! -f "$TMP/hook-ran" ]
 }
+
+@test "runner_blocks_when_generator_reports_error_even_with_diff" {
+  # Прогон 22.08: упор в бюджет дал is_error=true и пустой диф, а задача
+  # уехала в done. Здесь диф ЕСТЬ — MR всё равно не должен появиться.
+  cat > "$TMP/gen.sh" <<'GEN'
+#!/bin/sh
+printf 'половина работы\n' >> file.txt
+printf '{"is_error":true,"subtype":"error_max_budget_usd","total_cost_usd":0.53,"num_turns":4}'
+GEN
+  chmod +x "$TMP/gen.sh"
+  run env ORC_GEN_CMD="$TMP/gen.sh" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ -z "$(refs_in_target)" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"implement:failed"* ]]
+}

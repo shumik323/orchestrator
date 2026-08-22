@@ -1,0 +1,124 @@
+# Раннер одной задачи. Имена латиницей — см. scripts/run-bats.sh.
+
+setup() {
+  ORC_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+  TMP="$(mktemp -d)"
+  export ORC_STATE="$TMP/state"
+
+  # цель: bare с защищённым main и одним коммитом в нём
+  "$ORC_ROOT/scripts/make-remote.sh" "$TMP/target.git" main >/dev/null
+  git clone -q "$TMP/target.git" "$TMP/seed" 2>/dev/null
+  cd "$TMP/seed"
+  git config user.email seed@local
+  git config user.name seed
+  printf 'base\n' > file.txt
+  git add file.txt
+  git commit -qm base
+  # объекты попадают в bare только через push; main защищён хуком,
+  # поэтому сеем через разрешённую ветку и переставляем ref напрямую
+  git push -q origin HEAD:refs/heads/seed-tmp
+  git -C "$TMP/target.git" update-ref refs/heads/main "$(git rev-parse HEAD)"
+  git -C "$TMP/target.git" update-ref -d refs/heads/seed-tmp
+
+  QUEUE="$TMP/q.jsonl"
+  printf '%s\n' '{"id":"t1","title":"проба","body":"добавить строку","status":"ready","blocked_by":[],"schema_version":1}' > "$QUEUE"
+
+  CONF="$TMP/p.conf"
+  cat > "$CONF" <<EOF
+REPO_URL="$TMP/target.git"
+BASE_BRANCH="main"
+BRANCH_PREFIX="orc"
+GATE_CMD="true"
+MR_BACKEND="file"
+PUSH_OPTS=""
+MR_DIR="$TMP/mr"
+QUEUE_FILE="$QUEUE"
+DEADLINE_SEC="20"
+EOF
+}
+
+refs_in_target() {
+  git -C "$TMP/target.git" for-each-ref --format='%(refname)' 'refs/heads/orc/*'
+}
+
+@test "runner_opens_mr_when_diff_is_not_empty" {
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ -n "$(refs_in_target)" ]
+  [ -f "$TMP/mr/t1.md" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+}
+
+@test "runner_creates_no_mr_when_nothing_changed" {
+  before="$(git -C "$TMP/target.git" rev-parse refs/heads/main)"
+  run env ORC_GEN_CMD="true" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ -z "$(refs_in_target)" ]
+  [ "$(git -C "$TMP/target.git" rev-parse refs/heads/main)" = "$before" ]
+  run jq -rs 'map(.event) | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"no-change"* ]]
+}
+
+@test "runner_marks_blocked_on_generator_timeout" {
+  sed -i '' 's|DEADLINE_SEC="20"|DEADLINE_SEC="1"|' "$CONF"
+  run env ORC_GEN_CMD="sleep 30" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map(.event) | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"timeout"* ]]
+}
+
+@test "runner_creates_no_mr_when_gate_is_red" {
+  sed -i '' 's|GATE_CMD="true"|GATE_CMD="false"|' "$CONF"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"gate:red"* ]]
+}
+
+@test "runner_keeps_work_dir_for_postmortem" {
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ -d "$ORC_STATE/runs/t1/repo" ]
+  [ -f "$ORC_STATE/runs/t1/prompt.txt" ]
+}
+
+@test "runner_logs_cost_and_turns_from_generator_json" {
+  # генератор отдельным файлом: так же, как поведёт себя настоящий claude -p,
+  # который печатает JSON в stdout и правит файлы в рабочем дереве
+  cat > "$TMP/gen.sh" <<'GEN'
+#!/bin/sh
+printf 'сделано\n' >> file.txt
+printf '{"total_cost_usd":0.11,"num_turns":3,"is_error":false,"subtype":"success"}'
+GEN
+  chmod +x "$TMP/gen.sh"
+  run env ORC_GEN_CMD="$TMP/gen.sh" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.event=="result").payload.cost_usd' "$ORC_STATE/logs/t1/events.jsonl")" = "0.11" ]
+  [ "$(jq -r 'select(.event=="result").payload.turns' "$ORC_STATE/logs/t1/events.jsonl")" = "3" ]
+}
+
+@test "hooks_path_override_prevents_repo_hook_execution" {
+  # Проверка самой техники, не раннера: если флаг назван неверно,
+  # хук чужого репозитория исполнится при коммите.
+  git init -q "$TMP/hooked"
+  cd "$TMP/hooked"
+  git config user.email h@local
+  git config user.name h
+  mkdir -p .git/hooks
+  printf '%s\n' '#!/bin/sh' "printf x > $TMP/hook-ran" > .git/hooks/pre-commit
+  chmod +x .git/hooks/pre-commit
+  mkdir -p "$TMP/nohooks"
+  printf 'a\n' > a.txt
+  git -c core.hooksPath="$TMP/nohooks" add a.txt
+  git -c core.hooksPath="$TMP/nohooks" commit -qm no-hooks
+  [ ! -f "$TMP/hook-ran" ]
+}

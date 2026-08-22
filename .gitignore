@@ -1,0 +1,4 @@
+*.tmp
+*.jsonl.??????
+.DS_Store
+projects/*.local.conf

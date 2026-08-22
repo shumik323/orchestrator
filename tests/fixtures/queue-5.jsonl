@@ -1,0 +1,5 @@
+{"id":"t1","title":"закрыто","status":"done","blocked_by":[],"schema_version":1}
+{"id":"t2","title":"готово к работе","status":"ready","blocked_by":["t1"],"schema_version":1}
+{"id":"t3","title":"ждёт незакрытое","status":"ready","blocked_by":["t9"],"schema_version":1}
+{"id":"t4","title":"без поля blocked_by","status":"ready","schema_version":1}
+{"id":"t5","title":"не ready","status":"blocked","blocked_by":[],"schema_version":1}

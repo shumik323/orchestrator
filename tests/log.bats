@@ -81,3 +81,10 @@ setup() {
   [ "$status" -eq 0 ]
   [ "$(jq -r 'select(.event=="result-empty").phase' "$RUN/events.jsonl")" = "implement" ]
 }
+
+@test "generator_result_preserves_false_is_error" {
+  # Оператор // в jq считает false пустым: `.is_error // null` терял штатный false
+  printf '%s\n' '{"is_error":false,"num_turns":2}' > "$TMP/result.json"
+  bash -c ". '$LIB'; log_generator_result '$RUN' t1 '$TMP/result.json'"
+  [ "$(jq -r 'select(.event=="result").payload.is_error' "$RUN/events.jsonl")" = "false" ]
+}

@@ -52,10 +52,13 @@ log_generator_result() {
     return 0
   fi
 
-  payload="$(jq -c '{cost_usd: (.total_cost_usd // null),
-                     turns: (.num_turns // null),
-                     session_id: (.session_id // null),
-                     subtype: (.subtype // null),
-                     is_error: (.is_error // null)}' "$file")"
+  # Плейн-доступ, не оператор //: jq считает false пустым значением, и
+  # `.is_error // null` превратил бы штатный false в null. Отсутствующий ключ
+  # jq и без оператора отдаёт null.
+  payload="$(jq -c '{cost_usd: .total_cost_usd,
+                     turns: .num_turns,
+                     session_id: .session_id,
+                     subtype: .subtype,
+                     is_error: .is_error}' "$file")"
   log_event "$run_dir" "$task" "$phase" result "$payload"
 }

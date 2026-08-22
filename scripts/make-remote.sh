@@ -17,6 +17,12 @@ shift
 
 if [ "$#" -gt 0 ]; then
   protected="$*"
+  # пустая строка аргументом обнуляла список, и хук пропускал push в main:
+  # git config --get отдаёт пустое значение с кодом 0, фолбэк не срабатывал
+  if [ -z "$(printf '%s' "$protected" | tr -d '[:space:]')" ]; then
+    printf 'make-remote.sh: список защищённых веток пуст — так гардрейл выключается молча\n' >&2
+    exit 2
+  fi
 else
   protected="main master"
 fi

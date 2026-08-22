@@ -10,7 +10,10 @@
 # а не ошибка, и падение по -e превратило бы отказ в непонятный сбой.
 set -u
 
-protected="$(git config --get orc.protected 2>/dev/null || printf 'main master')"
+protected="$(git config --get orc.protected 2>/dev/null || printf '')"
+# git config --get отдаёт пустую строку с кодом 0, поэтому проверять надо
+# значение, а не код возврата: иначе пустой конфиг = отключённый хук
+[ -n "$protected" ] || protected="main master"
 status=0
 
 # Нулевой хэш означает создание или удаление ссылки. Длина хэша не фиксируется:

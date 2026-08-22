@@ -65,3 +65,16 @@ setup() {
 @test "hook_is_installed_executable" {
   [ -x "$TMP/origin.git/hooks/pre-receive" ]
 }
+
+@test "make_remote_refuses_empty_protected_list" {
+  run "$ORC_ROOT/scripts/make-remote.sh" "$TMP/empty.git" ""
+  [ "$status" -eq 2 ]
+}
+
+@test "hook_falls_back_when_config_value_is_empty" {
+  # git config --get отдаёт пустое значение с кодом 0 — раньше это отключало хук
+  git -C "$TMP/origin.git" config orc.protected ""
+  run git push origin HEAD:refs/heads/main
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"защищена"* ]]
+}

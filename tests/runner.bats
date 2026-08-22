@@ -140,3 +140,131 @@ GEN
   run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
   [[ "$output" == *"implement:failed"* ]]
 }
+
+# .harness.conf кладётся в целевой репозиторий: так же, как его туда положит
+# bootstrap.sh настоящего инстанса харнесса.
+seed_conf() {
+  cd "$TMP/seed"
+  cat > .harness.conf
+  git add .harness.conf
+  git commit -qm conf
+  git push -q origin HEAD:refs/heads/seed-conf
+  git -C "$TMP/target.git" update-ref refs/heads/main "$(git rev-parse HEAD)"
+  git -C "$TMP/target.git" update-ref -d refs/heads/seed-conf
+}
+
+@test "gate_cmd_comes_from_instance_conf_not_from_project_conf" {
+  seed_conf <<EOF
+GATE_CMD="touch $TMP/gate-from-instance"
+EOF
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ -f "$TMP/gate-from-instance" ]
+}
+
+@test "readonly_zone_change_is_blocked_before_gate" {
+  seed_conf <<EOF
+READONLY_ZONES="dist"
+GATE_CMD="true"
+EOF
+  run env ORC_GEN_CMD="sh -c 'mkdir -p dist && printf x > dist/app.js'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ -z "$(refs_in_target)" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"scope:readonly-violation"* ]]
+}
+
+@test "secret_scan_red_blocks_push_and_mr" {
+  seed_conf <<EOF
+GATE_CMD="true"
+SECRET_SCAN_CMD="false"
+EOF
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"secret-scan:red"* ]]
+}
+
+@test "instance_conf_is_parsed_not_sourced_by_runner" {
+  seed_conf <<EOF
+GATE_CMD="true"
+touch "$TMP/conf-was-sourced"
+EOF
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ ! -f "$TMP/conf-was-sourced" ]
+}
+
+@test "gate_test_cmd_from_instance_runs_before_push" {
+  seed_conf <<EOF
+GATE_CMD="true"
+GATE_TEST_CMD="touch $TMP/full-tests-ran"
+EOF
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ -f "$TMP/full-tests-ran" ]
+  [ -f "$TMP/mr/t1.md" ]
+}
+
+@test "gate_test_cmd_red_blocks_push_and_mr" {
+  seed_conf <<EOF
+GATE_CMD="true"
+GATE_TEST_CMD="false"
+EOF
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"gate-test:red"* ]]
+}
+
+@test "task_id_with_shell_metacharacters_is_refused" {
+  run "$ORC_ROOT/scripts/run-task.sh" "$CONF" "x'\$(printf ВЗЛОМ > $TMP/pwned)'y"
+  [ "$status" -eq 2 ]
+  [ ! -f "$TMP/pwned" ]
+}
+
+@test "readonly_zone_is_enforced_for_non_ascii_filename" {
+  seed_conf <<EOF
+READONLY_ZONES="dist"
+GATE_CMD="true"
+EOF
+  run env ORC_GEN_CMD="sh -c 'mkdir -p dist && printf x > dist/файл.js'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"scope:readonly-violation"* ]]
+}
+
+@test "readonly_zone_is_enforced_for_rename_into_zone" {
+  seed_conf <<EOF
+READONLY_ZONES="dist"
+GATE_CMD="true"
+EOF
+  run env ORC_GEN_CMD="sh -c 'mkdir -p dist && git mv file.txt dist/file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+}
+
+@test "mr_backend_failure_blocks_instead_of_reporting_done" {
+  sed -i '' 's|MR_BACKEND="file"|MR_BACKEND="carrier-pigeon"|' "$CONF"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"mr:failed"* ]]
+}

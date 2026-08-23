@@ -69,3 +69,11 @@ setup() {
   [ "$status" -eq 0 ]
   [ "$(wc -l < "$Q" | tr -d ' ')" = "7" ]
 }
+
+@test "queue_set_status_refuses_to_overwrite_on_broken_line" {
+  printf '{"id":"битая\n' >> "$Q"
+  before="$(cat "$Q")"
+  run bash -c ". '$LIB'; queue_set_status '$Q' t2 done"
+  [ "$status" -ne 0 ]
+  [ "$(cat "$Q")" = "$before" ]
+}

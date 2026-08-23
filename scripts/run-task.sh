@@ -19,6 +19,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/watchdog.sh"
 # shellcheck source=lib/harness.sh
 . "$HERE/lib/harness.sh"
+# shellcheck source=lib/ui.sh
+. "$HERE/lib/ui.sh"
 
 conf="${1:?использование: run-task.sh <project-conf> <task-id>}"
 task_id="${2:?task-id}"
@@ -47,6 +49,7 @@ esac
 : "${GATE_WORKDIR:=}"
 : "${READONLY_ZONES:=}"
 : "${SECRET_SCAN_CMD:=}"
+: "${WRITE_SCOPE:=}"
 
 orc_init_state
 work="$(orc_task_dir "$task_id")"
@@ -72,6 +75,8 @@ set_status() {
 
 branch="$BRANCH_PREFIX/$task_id"
 
+ui_task "$task_id" "$branch → $BASE_BRANCH"
+ui_phase "клон $BASE_BRANCH"
 log_event "$run_dir" "$task_id" clone started
 if [ ! -d "$work/repo/.git" ]; then
   g clone -q --branch "$BASE_BRANCH" "$REPO_URL" "$work/repo" || {
@@ -80,7 +85,16 @@ if [ ! -d "$work/repo/.git" ]; then
     exit 1
   }
 fi
-g -C "$work/repo" checkout -q -B "$branch"
+# Повторный прогон обязан начинаться с чистого дерева базовой ветки.
+# Иначе он читает .harness.conf, который мог переписать генератор прошлого
+# прогона, и наследует его незакоммиченную работу — MR появлялся там,
+# где генератор не сделал ничего.
+# clean без -x: игнорируемое (node_modules) переживает прогон, иначе
+# повторный запуск станет дороже самого прогона.
+g -C "$work/repo" fetch -q origin "$BASE_BRANCH"
+g -C "$work/repo" checkout -q -B "$branch" "origin/$BASE_BRANCH"
+g -C "$work/repo" reset -q --hard "origin/$BASE_BRANCH"
+g -C "$work/repo" clean -qfd
 g -C "$work/repo" config user.email "orchestrator@local"
 g -C "$work/repo" config user.name "orchestrator"
 # Шаг 1. Гейт и зоны принадлежат инстансу: держать их копию в конфиге раннера
@@ -92,11 +106,13 @@ if [ -f "$inst_conf" ]; then
     val="$(harness_conf_get "$inst_conf" "$key")"
     [ -n "$val" ] && eval "$key=\"\$val\""
   done
+  ui_info "из .harness.conf: гейт [${GATE_CMD}], зоны [${READONLY_ZONES:-нет}]"
   log_event "$run_dir" "$task_id" clone harness-conf \
     "$(jq -cn --arg g "$GATE_CMD" --arg z "$READONLY_ZONES" \
        '{gate_cmd: $g, readonly_zones: $z}')"
 fi
 
+ui_ok "клон"
 log_event "$run_dir" "$task_id" clone finished
 
 # Промпт — файлом на диске: он же артефакт разбора, если прогон провалится.
@@ -107,12 +123,26 @@ else
   printf 'задача %s\n' "$task_id" > "$work/prompt.txt"
 fi
 
+# Пустой промпт означает, что задачи с таким id в очереди нет. Запускать
+# на этом генератор — прогон модели без задания за деньги подписки.
+if [ ! -s "$work/prompt.txt" ]; then
+  ui_fail "промпт пуст: задачи $task_id нет в очереди"
+  log_event "$run_dir" "$task_id" implement prompt-empty
+  set_status "blocked"
+  exit 1
+fi
+
+task_scope="$(jq -r --arg id "$task_id" 'select(.id == $id) | .scope // empty' \
+  "${QUEUE_FILE:-/dev/null}" 2>/dev/null || true)"
+[ -n "$task_scope" ] && WRITE_SCOPE="$task_scope"
+
 default_gen="claude -p --output-format json --max-budget-usd $MAX_BUDGET_USD \
 --allowedTools $ALLOWED_TOOLS --permission-mode acceptEdits"
 gen_cmd="${ORC_GEN_CMD:-$default_gen}"
 gen_out="$(log_phase_stdout "$run_dir" implement)"
 
 set_status "running"
+ui_phase "генератор, дедлайн ${DEADLINE_SEC}с"
 log_event "$run_dir" "$task_id" implement started \
   "$(jq -cn --arg d "$DEADLINE_SEC" '{deadline_sec: $d}')"
 
@@ -121,6 +151,7 @@ run_with_deadline "$DEADLINE_SEC" \
 gen_rc=$?
 
 if [ "$gen_rc" -eq 124 ]; then
+  ui_fail "генератор не уложился в ${DEADLINE_SEC}с"
   log_event "$run_dir" "$task_id" implement timeout \
     "$(jq -cn --arg d "$DEADLINE_SEC" '{deadline_sec: $d}')"
   set_status "blocked"
@@ -130,6 +161,10 @@ if [ "$gen_rc" -eq 124 ]; then
 fi
 
 log_generator_result "$run_dir" "$task_id" "$gen_out"
+ui_ok "генератор"
+gen_cost="$(jq -r '.total_cost_usd // empty' "$gen_out" 2>/dev/null || true)"
+gen_turns="$(jq -r '.num_turns // empty' "$gen_out" 2>/dev/null || true)"
+[ -n "$gen_cost" ] && ui_info "стоимость $gen_cost USD, ходов ${gen_turns:-?}"
 log_event "$run_dir" "$task_id" implement finished \
   "$(jq -cn --arg rc "$gen_rc" '{exit_code: $rc}')"
 
@@ -140,6 +175,7 @@ gen_err="$(jq -r '
   if (.is_error == true) or (((.subtype // "") | startswith("error")))
   then (.subtype // "error") else empty end' "$gen_out" 2>/dev/null || true)"
 if [ -n "$gen_err" ]; then
+  ui_fail "генератор завершился ошибкой: $gen_err"
   log_event "$run_dir" "$task_id" implement failed \
     "$(jq -cn --arg s "$gen_err" '{subtype: $s}')"
   set_status "blocked"
@@ -156,6 +192,7 @@ changed="$(changed_paths)" || {
 }
 
 if [ -z "$changed" ]; then
+  ui_done "правка не потребовалась, MR не создан"
   log_event "$run_dir" "$task_id" implement no-change
   set_status "done"
   printf 'правка не потребовалась — MR не создан\n'
@@ -167,6 +204,7 @@ fi
 if [ -n "$READONLY_ZONES" ]; then
   viol="$(printf '%s\n' "$changed" | harness_readonly_violations "$READONLY_ZONES")"
   if [ -n "$viol" ]; then
+    ui_fail "дифф трогает readonly-зоны"
     log_event "$run_dir" "$task_id" scope readonly-violation \
       "$(printf '%s' "$viol" | jq -Rcs '{paths: split("\n")}')"
     set_status "blocked"
@@ -175,29 +213,47 @@ if [ -n "$READONLY_ZONES" ]; then
   fi
 fi
 
+# Граница области работы. Промпт просит держаться модуля, эта проверка обязывает.
+if [ -n "$WRITE_SCOPE" ]; then
+  out_of_scope="$(printf '%s\n' "$changed" | harness_scope_violations "$WRITE_SCOPE")"
+  if [ -n "$out_of_scope" ]; then
+    ui_fail "дифф вышел за область [$WRITE_SCOPE]"
+    log_event "$run_dir" "$task_id" scope out-of-scope \
+      "$(printf '%s' "$out_of_scope" | jq -Rcs '{paths: split("\n"), allowed: "'"$WRITE_SCOPE"'"}')"
+    set_status "blocked"
+    printf 'дифф вышел за разрешённую область [%s]:\n%s\n' "$WRITE_SCOPE" "$out_of_scope" >&2
+    exit 1
+  fi
+fi
+
 gate_out="$(log_phase_stdout "$run_dir" gate)"
+ui_phase "гейт: $GATE_CMD"
 log_event "$run_dir" "$task_id" gate started
 gate_dir="$work/repo${GATE_WORKDIR:+/$GATE_WORKDIR}"
 run_with_deadline "$DEADLINE_SEC" bash -c "cd '$gate_dir' && $GATE_CMD" > "$gate_out" 2>&1
 gate_rc=$?
 
 if [ "$gate_rc" -ne 0 ]; then
+  ui_fail "гейт красный (код $gate_rc)"
   log_event "$run_dir" "$task_id" gate red "$(jq -cn --arg rc "$gate_rc" '{exit_code: $rc}')"
   set_status "blocked"
   printf 'гейт красный (код %s) — MR не создаётся, разбор в %s\n' "$gate_rc" "$gate_out" >&2
   exit 1
 fi
+ui_ok "гейт"
 log_event "$run_dir" "$task_id" gate green
 
 # Полный прогон тестов инстанса. У шаблона это Ярус 3: гоняется только перед
 # push, а не на каждой правке — дорого. Пусто → инстанс его не объявил.
 if [ -n "$GATE_TEST_CMD" ]; then
   test_out="$(log_phase_stdout "$run_dir" gate-test)"
+  ui_phase "полный прогон тестов: $GATE_TEST_CMD"
   log_event "$run_dir" "$task_id" gate-test started
   run_with_deadline "$DEADLINE_SEC" bash -c "cd '$gate_dir' && $GATE_TEST_CMD" \
     > "$test_out" 2>&1
   test_rc=$?
   if [ "$test_rc" -ne 0 ]; then
+    ui_fail "полный прогон тестов красный (код $test_rc)"
     log_event "$run_dir" "$task_id" gate-test red \
       "$(jq -cn --arg rc "$test_rc" '{exit_code: $rc}')"
     set_status "blocked"
@@ -205,17 +261,20 @@ if [ -n "$GATE_TEST_CMD" ]; then
       "$test_rc" "$test_out" >&2
     exit 1
   fi
+  ui_ok "полный прогон тестов"
   log_event "$run_dir" "$task_id" gate-test green
 fi
 
 # Шаг 3. Секрет, уехавший в MR, дороже красного гейта. Скан задаёт инстанс.
 if [ -n "$SECRET_SCAN_CMD" ]; then
   scan_out="$(log_phase_stdout "$run_dir" secret-scan)"
+  ui_phase "секрет-скан"
   log_event "$run_dir" "$task_id" secret-scan started
   run_with_deadline "$DEADLINE_SEC" bash -c "cd '$work/repo' && $SECRET_SCAN_CMD" \
     > "$scan_out" 2>&1
   scan_rc=$?
   if [ "$scan_rc" -ne 0 ]; then
+    ui_fail "секрет-скан красный (код $scan_rc)"
     log_event "$run_dir" "$task_id" secret-scan red \
       "$(jq -cn --arg rc "$scan_rc" '{exit_code: $rc}')"
     set_status "blocked"
@@ -223,6 +282,7 @@ if [ -n "$SECRET_SCAN_CMD" ]; then
       "$scan_rc" "$scan_out" >&2
     exit 1
   fi
+  ui_ok "секрет-скан"
   log_event "$run_dir" "$task_id" secret-scan green
 fi
 
@@ -237,6 +297,7 @@ g -C "$work/repo" push --no-verify $PUSH_OPTS -q origin "$branch" || {
   printf 'push отклонён — см. гардрейл целевого репозитория\n' >&2
   exit 1
 }
+ui_ok "push $branch"
 log_event "$run_dir" "$task_id" push finished "$(jq -cn --arg b "$branch" '{branch: $b}')"
 
 body="$work/mr-body.md"
@@ -249,11 +310,13 @@ body="$work/mr-body.md"
 
 mr_path="$(mr_create "$MR_DIR" "$branch" "$BASE_BRANCH" "orc($task_id)" "$body")" || mr_path=""
 if [ -z "$mr_path" ]; then
+  ui_fail "MR не создан, а ветка уже запушена"
   log_event "$run_dir" "$task_id" mr failed
   set_status "blocked"
   printf 'MR не создан, а ветка уже запушена — задача blocked, разбирать вручную\n' >&2
   exit 1
 fi
+ui_done "MR: $mr_path"
 log_event "$run_dir" "$task_id" mr created "$(jq -cn --arg p "$mr_path" '{path: $p}')"
 set_status "done"
 printf 'MR: %s\n' "$mr_path"

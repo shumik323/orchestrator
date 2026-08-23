@@ -268,3 +268,59 @@ EOF
   run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
   [[ "$output" == *"mr:failed"* ]]
 }
+
+@test "unknown_task_id_is_blocked_before_generator_runs" {
+  run env ORC_GEN_CMD="touch $TMP/generator-ran" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t99
+  [ "$status" -ne 0 ]
+  [ ! -f "$TMP/generator-ran" ]
+  run jq -rs 'map(.event) | join(" ")' "$ORC_STATE/logs/t99/events.jsonl"
+  [[ "$output" == *"prompt-empty"* ]]
+}
+
+@test "repeat_run_starts_from_clean_base_not_from_previous_leftovers" {
+  seed_conf <<EOF
+GATE_CMD="grep -q правка file.txt"
+EOF
+  # прогон 1: генератор пишет мимо гейта и подменяет конфиг инстанса
+  run env ORC_GEN_CMD="sh -c 'printf мимо >> file.txt; printf %s \"GATE_CMD=true\" > .harness.conf'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  # прогон 2: генератор не делает ничего — унаследованной работы быть не должно
+  jq -c '.status="ready"' "$QUEUE" > "$QUEUE.2" && mv "$QUEUE.2" "$QUEUE"
+  run env ORC_GEN_CMD="true" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ -z "$(refs_in_target)" ]
+  run jq -rs 'map(.event) | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"no-change"* ]]
+}
+
+@test "write_scope_blocks_change_outside_the_area" {
+  printf 'WRITE_SCOPE="allowed"\n' >> "$CONF"
+  run env ORC_GEN_CMD="sh -c 'mkdir -p allowed other && printf x > allowed/ok.ts && printf x > other/bad.ts'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"scope:out-of-scope"* ]]
+}
+
+@test "write_scope_allows_change_inside_the_area" {
+  printf 'WRITE_SCOPE="allowed"\n' >> "$CONF"
+  run env ORC_GEN_CMD="sh -c 'mkdir -p allowed && printf x > allowed/ok.ts'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ -f "$TMP/mr/t1.md" ]
+}
+
+@test "scope_declared_in_task_overrides_project_conf" {
+  printf 'WRITE_SCOPE="allowed"\n' >> "$CONF"
+  # у задачи своя область — она точнее конфига проекта
+  jq -c '. + {scope:"other"}' "$QUEUE" > "$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
+  run env ORC_GEN_CMD="sh -c 'mkdir -p other && printf x > other/ok.ts'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ -f "$TMP/mr/t1.md" ]
+}

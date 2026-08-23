@@ -15,18 +15,21 @@ run_with_deadline() {
   local rcfile pid waited=0 rc
   rcfile="$(mktemp)"
 
+  # job control включается на время запуска, чтобы фоновое задание получило
+  # свою группу процессов: убивать надо группу, а не список прямых детей —
+  # внук (сборка, тестовый прогон внутри генератора) иначе переживает дедлайн
+  set -m
   ( "$@"; printf '%s' "$?" > "$rcfile" ) &
   pid=$!
+  set +m
 
   while [ ! -s "$rcfile" ]; do
     if [ "$waited" -ge "$deadline" ]; then
       # сначала внуки, потом сам подшелл: claude -p живёт грандчайлдом,
       # и убитый только подшелл оставил бы его держать каталог и квоту
-      pkill -TERM -P "$pid" 2>/dev/null || true
-      kill -TERM "$pid" 2>/dev/null || true
+      kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
       sleep 1
-      pkill -KILL -P "$pid" 2>/dev/null || true
-      kill -KILL "$pid" 2>/dev/null || true
+      kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
       rm -f "$rcfile"
       return 124

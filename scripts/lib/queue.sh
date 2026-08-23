@@ -26,7 +26,11 @@ queue_set_status() {
   local id="${2:?id}" st="${3:?status}" tmp
   tmp="$(mktemp "${qf}.XXXXXX")"
   jq -c --arg id "$id" --arg st "$st" \
-    'if .id == $id then .status = $st else . end' "$qf" > "$tmp"
+    'if .id == $id then .status = $st else . end' "$qf" > "$tmp" || {
+      rm -f "$tmp"
+      printf 'queue_set_status: jq не разобрал очередь, файл не изменён\n' >&2
+      return 1
+    }
   mv "$tmp" "$qf"
 }
 
@@ -37,7 +41,10 @@ queue_bump_attempts() {
   local id="${2:?id}" tmp
   tmp="$(mktemp "${qf}.XXXXXX")"
   jq -c --arg id "$id" \
-    'if .id == $id then .attempts = ((.attempts // 0) + 1) else . end' "$qf" > "$tmp"
+    'if .id == $id then .attempts = ((.attempts // 0) + 1) else . end' "$qf" > "$tmp" || {
+      rm -f "$tmp"
+      return 1
+    }
   mv "$tmp" "$qf"
 }
 

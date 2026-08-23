@@ -26,7 +26,7 @@ setup() {
   [ "$status" -eq 124 ]
 }
 
-@test "grandchild_is_killed_not_left_running" {
+@test "direct_child_is_killed_on_deadline" {
   run bash -c ". '$LIB'; run_with_deadline 1 sh -c 'sleep 4; printf x > \"$TMP/marker\"'"
   [ "$status" -eq 124 ]
   sleep 5
@@ -36,4 +36,13 @@ setup() {
 @test "command_output_reaches_caller" {
   run bash -c ". '$LIB'; run_with_deadline 5 printf 'вывод\n'"
   [ "$output" = "вывод" ]
+}
+
+@test "grandchild_process_is_killed_with_the_group" {
+  # Прежний тест носил имя про внука, а маркер писал прямой ребёнок. Здесь
+  # маркер пишет именно внук: убийство списка прямых детей его не достанет.
+  run bash -c ". '$LIB'; run_with_deadline 1 sh -c '(sleep 4; printf x > \"$TMP/gm\") & wait'"
+  [ "$status" -eq 124 ]
+  sleep 5
+  [ ! -f "$TMP/gm" ]
 }

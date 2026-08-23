@@ -102,3 +102,23 @@ EOF
   run bash -c ". '$LIB'; harness_conf_has '$CONF' NO_SUCH_KEY"
   [ "$status" -ne 0 ]
 }
+
+@test "scope_violations_allows_paths_inside_area" {
+  run bash -c "printf 'src/features/x/a.ts\nsrc/features/x/ui/b.vue\n' | { . '$LIB'; harness_scope_violations 'src/features/x'; }"
+  [ -z "$output" ]
+}
+
+@test "scope_violations_flags_paths_outside_area" {
+  run bash -c "printf 'src/features/x/a.ts\nsrc/shared/util.ts\n' | { . '$LIB'; harness_scope_violations 'src/features/x'; }"
+  [ "$output" = "src/shared/util.ts" ]
+}
+
+@test "scope_violations_does_not_match_sibling_with_same_prefix" {
+  run bash -c "printf 'src/features/xyz/a.ts\n' | { . '$LIB'; harness_scope_violations 'src/features/x'; }"
+  [ "$output" = "src/features/xyz/a.ts" ]
+}
+
+@test "scope_violations_empty_area_allows_everything" {
+  run bash -c "printf 'anywhere/a.ts\n' | { . '$LIB'; harness_scope_violations ''; }"
+  [ -z "$output" ]
+}

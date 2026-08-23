@@ -57,3 +57,24 @@ harness_readonly_violations() {
     done
   done
 }
+
+# Пути из stdin → те, что лежат ВНЕ разрешённой области.
+# Зеркало readonly-зон: там «куда нельзя», здесь «где только и можно».
+# Нужно, когда у модуля есть граница по договорённости, но линтер её не держит:
+# агент правит один bounded context, всё остальное для него чужое.
+harness_scope_violations() {
+  local allowed="${1:-}" path prefix ok
+  [ -n "$allowed" ] || return 0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    ok=""
+    # список префиксов разворачивается словами намеренно
+    # shellcheck disable=SC2086
+    for prefix in $allowed; do
+      case "$path" in
+        "$prefix"|"$prefix"/*) ok=1; break ;;
+      esac
+    done
+    [ -n "$ok" ] || printf '%s\n' "$path"
+  done
+}

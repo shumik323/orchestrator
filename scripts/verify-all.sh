@@ -6,8 +6,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 rc=0
 
-"$HERE/lint-shell.sh" || rc=1
-"$HERE/run-bats.sh"   || rc=1
+"$HERE/lint-shell.sh"                   || rc=1
+"$HERE/check-no-internal.sh" >/dev/null || rc=1
+"$HERE/run-bats.sh"                     || rc=1
 
 if [ "$rc" -eq 0 ]; then
   printf 'verify-all: зелёный\n'

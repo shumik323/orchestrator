@@ -88,3 +88,30 @@ setup() {
   bash -c ". '$LIB'; log_generator_result '$RUN' t1 '$TMP/result.json'"
   [ "$(jq -r 'select(.event=="result").payload.is_error' "$RUN/events.jsonl")" = "false" ]
 }
+
+# Живой прогон 25.08: claude печатает в stdout предупреждение о недоверенном
+# workspace ДО json, а хук инстанса — сообщение ПОСЛЕ. Разбор файла целиком дал
+# result-unparseable, и стоимость прогона в лог не попала.
+@test "generator_result_finds_json_line_among_noise" {
+  {
+    printf 'Ignoring 11 permissions.allow entries: workspace has not been trusted\n'
+    printf '%s\n' '{"total_cost_usd":0.88,"num_turns":11,"is_error":false,"subtype":"success"}'
+    printf 'SessionEnd hook failed: not supported outside REPL\n'
+  } > "$TMP/result.json"
+  run bash -c ". '$LIB'; log_generator_result '$RUN' t1 '$TMP/result.json'"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.event=="result").payload.cost_usd' "$RUN/events.jsonl")" = "0.88" ]
+  [ "$(jq -r 'select(.event=="result").payload.turns' "$RUN/events.jsonl")" = "11" ]
+  [ "$(jq -r 'select(.event=="result").payload.is_error' "$RUN/events.jsonl")" = "false" ]
+  run grep -c 'result-unparseable' "$RUN/events.jsonl"
+  [ "$output" = "0" ]
+}
+
+# Мусор без единой json-строки обязан остаться unparseable: иначе провал генератора
+# начнёт читаться как успешный прогон без метрик.
+@test "generator_result_stays_unparseable_without_any_json_line" {
+  printf 'Segmentation fault\nsome trailing noise\n' > "$TMP/result.json"
+  run bash -c ". '$LIB'; log_generator_result '$RUN' t1 '$TMP/result.json'"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.event=="result-unparseable").phase' "$RUN/events.jsonl")" = "implement" ]
+}

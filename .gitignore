@@ -2,3 +2,5 @@
 *.jsonl.??????
 .DS_Store
 projects/*.local.conf
+mr/
+queue/*.jsonl

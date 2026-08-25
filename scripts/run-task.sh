@@ -50,6 +50,8 @@ esac
 : "${READONLY_ZONES:=}"
 : "${SECRET_SCAN_CMD:=}"
 : "${WRITE_SCOPE:=}"
+: "${SETUP_CMD:=}"
+: "${SETUP_MARKER:=node_modules}"
 
 orc_init_state
 work="$(orc_task_dir "$task_id")"
@@ -115,6 +117,39 @@ fi
 ui_ok "клон"
 log_event "$run_dir" "$task_id" clone finished
 
+# Шаг 1а. Зависимости проекта ставятся до генератора, а не до гейта: генератор
+# сам запускает тесты, и клон без них учит его, что проверка недоступна.
+# Каталог клона свой у каждой задачи, поэтому clean без -x бережёт установленное
+# только между повторами ОДНОЙ задачи — соседняя приходит в пустое дерево.
+# Маркер вместо безусловного вызова: npm ci сносит и ставит дерево заново,
+# и повтор задачи стоил бы дороже самого прогона.
+if [ -n "$SETUP_CMD" ] && [ ! -e "$work/repo/$SETUP_MARKER" ]; then
+  setup_out="$(log_phase_stdout "$run_dir" setup)"
+  ui_phase "зависимости: $SETUP_CMD"
+  log_event "$run_dir" "$task_id" setup started \
+    "$(jq -cn --arg c "$SETUP_CMD" --arg m "$SETUP_MARKER" '{cmd: $c, marker: $m}')"
+  run_with_deadline "$DEADLINE_SEC" \
+    bash -c "cd '$work/repo' && $SETUP_CMD" > "$setup_out" 2>&1
+  setup_rc=$?
+  # Провал установки читался бы как «править было нечего»: генератор в дереве
+  # без зависимостей делает пустой диф, а не работу.
+  if [ "$setup_rc" -ne 0 ]; then
+    ui_fail "зависимости не встали (код $setup_rc)"
+    log_event "$run_dir" "$task_id" setup failed \
+      "$(jq -cn --arg rc "$setup_rc" '{exit_code: $rc}')"
+    set_status "blocked"
+    printf 'setup провалился (код %s) — генератор не запускался, разбор в %s\n' \
+      "$setup_rc" "$setup_out" >&2
+    exit 1
+  fi
+  ui_ok "зависимости"
+  log_event "$run_dir" "$task_id" setup finished
+elif [ -n "$SETUP_CMD" ]; then
+  ui_info "зависимости на месте ($SETUP_MARKER), setup пропущен"
+  log_event "$run_dir" "$task_id" setup skipped \
+    "$(jq -cn --arg m "$SETUP_MARKER" '{marker: $m}')"
+fi
+
 # Промпт — файлом на диске: он же артефакт разбора, если прогон провалится.
 if [ -n "$QUEUE_FILE" ] && [ -f "$QUEUE_FILE" ]; then
   jq -r --arg id "$task_id" 'select(.id == $id) | "\(.title)\n\n\(.body)"' \
@@ -123,8 +158,29 @@ else
   printf 'задача %s\n' "$task_id" > "$work/prompt.txt"
 fi
 
+# Границы прогона дописываются к КАЖДОЙ задаче. Репозиторий инстанса несёт свои
+# правила ведения работы — буфер наблюдений, лог сессии, порядок коммитов — и
+# генератор читает их вместе с CLAUDE.md, потому что источник project мы намеренно
+# оставляем. Дальше он их честно исполняет, а для петли запись в такой файл это
+# выход за область и потеря всей сделанной работы.
+# Прогон 25.08: готовая правка на $1.89 заблокирована одной строкой, дописанной
+# в .claude/PENDING-NOTES.md по правилу репозитория.
+# Дописываются ПОСЛЕ тела задачи: последняя инструкция весит больше в длинном промпте.
+if [ -s "$work/prompt.txt" ]; then
+  {
+    printf '\n\n---\n\n'
+    printf 'Границы прогона. Это указания раннера, и они сильнее процессных правил репозитория:\n'
+    printf -- '- Не веди буферы наблюдений и заметок, не дописывай логи проекта, не заводи отчётные файлы.\n'
+    printf -- '- Ничего не коммить и не пушить: ветку и коммит делает раннер сам.\n'
+    printf -- '- Правь только файлы, названные в задаче. Один лишний файл в диффе отменяет весь прогон.\n'
+    printf -- '- Всё, что заметил по ходу, отдай итоговым ответом — его читает человек.\n'
+  } >> "$work/prompt.txt"
+fi
+
 # Пустой промпт означает, что задачи с таким id в очереди нет. Запускать
 # на этом генератор — прогон модели без задания за деньги подписки.
+# Проверка идёт ПОСЛЕ дописывания границ, но смотрит на исходное тело: границы
+# добавляются только к непустому промпту, иначе они сами сделали бы файл непустым.
 if [ ! -s "$work/prompt.txt" ]; then
   ui_fail "промпт пуст: задачи $task_id нет в очереди"
   log_event "$run_dir" "$task_id" implement prompt-empty
@@ -136,8 +192,17 @@ task_scope="$(jq -r --arg id "$task_id" 'select(.id == $id) | .scope // empty' \
   "${QUEUE_FILE:-/dev/null}" 2>/dev/null || true)"
 [ -n "$task_scope" ] && WRITE_SCOPE="$task_scope"
 
+# disableAllHooks: хуки инстанса не гейтятся доверием к каталогу и в headless
+# отрабатывают всегда — прогон 25.08 поймал падение SessionEnd-хука целевого репозитория прямо
+# внутри задачи. Ярус «проверка на конце хода» раннер и так вызывает сам, поэтому
+# хуки клонированного репозитория здесь только мешают.
+# Гасится ИМЕННО так, а не через --setting-sources: тот исключил бы источник
+# project целиком, а вместе с ним CLAUDE.md репозитория — правила проекта боту
+# нужны. Замер 25.08: с этим флагом ошибка SessionEnd исчезает, а ответ про
+# правила проекта приходит без единого обращения к файлам.
 default_gen="claude -p --output-format json --max-budget-usd $MAX_BUDGET_USD \
---allowedTools $ALLOWED_TOOLS --permission-mode acceptEdits"
+--allowedTools $ALLOWED_TOOLS --permission-mode acceptEdits \
+--settings '{\"disableAllHooks\": true}'"
 gen_cmd="${ORC_GEN_CMD:-$default_gen}"
 gen_out="$(log_phase_stdout "$run_dir" implement)"
 

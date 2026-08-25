@@ -324,3 +324,91 @@ EOF
   [ "$status" -eq 0 ]
   [ -f "$TMP/mr/t1.md" ]
 }
+
+# --- setup-фаза: зависимости проекта ---
+# Клон приходит в каталог задачи, поэтому у соседней задачи дерево пустое.
+# Гейт в таком клоне краснеет на отсутствии инструмента, а не на работе генератора.
+
+@test "runner_runs_setup_when_marker_is_missing" {
+  printf 'SETUP_CMD="mkdir -p node_modules && printf ok > node_modules/.stamp"\n' >> "$CONF"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ -f "$ORC_STATE/runs/t1/repo/node_modules/.stamp" ]
+  # порядок фаз: setup обязан лечь до генератора, иначе генератор
+  # запускается в дереве без зависимостей и делает пустой диф
+  run jq -rs 'map(select(.phase=="setup" or .phase=="implement") | .phase + ":" + .event) | join(" ")' \
+    "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == "setup:started setup:finished implement:started"* ]]
+}
+
+@test "runner_skips_setup_when_marker_exists" {
+  # file.txt лежит в базовой ветке, то есть маркер на месте с первого клона
+  printf 'SETUP_MARKER="file.txt"\nSETUP_CMD="exit 7"\n' >> "$CONF"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  run jq -rs 'map(select(.phase=="setup") | .event) | join(" ")' \
+    "$ORC_STATE/logs/t1/events.jsonl"
+  [ "$output" = "skipped" ]
+}
+
+@test "runner_blocks_when_setup_fails" {
+  printf 'SETUP_CMD="exit 3"\n' >> "$CONF"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 1 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ -z "$(refs_in_target)" ]
+  # генератор не должен был запуститься вовсе
+  run jq -rs 'map(select(.phase=="implement")) | length' "$ORC_STATE/logs/t1/events.jsonl"
+  [ "$output" = "0" ]
+}
+
+# Хуки инстанса не гейтятся доверием к каталогу: прогон 25.08 поймал падение
+# SessionEnd-хука целевого репозитория внутри задачи. Гасим их флагом, но НЕ через
+# --setting-sources: тот унёс бы вместе с настройками и CLAUDE.md репозитория.
+@test "runner_disables_instance_hooks_in_generator_call" {
+  bin="$TMP/bin"; mkdir -p "$bin"
+  # стаб перехватывает аргументы: настоящий claude в тестах не запускается
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" > "%s/claude-args.txt"\nprintf "{}"\n' \
+    "$TMP" > "$bin/claude"
+  chmod +x "$bin/claude"
+  run env PATH="$bin:$PATH" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ -f "$TMP/claude-args.txt" ]
+  run grep -F 'disableAllHooks' "$TMP/claude-args.txt"
+  [ "$status" -eq 0 ]
+  # источник project остаётся: без него уедет CLAUDE.md проекта
+  run grep -F 'setting-sources' "$TMP/claude-args.txt"
+  [ "$status" -ne 0 ]
+}
+
+# Репозиторий инстанса несёт свои процессные правила, и генератор их исполняет:
+# прогон 25.08 потерял готовую правку из-за строки, дописанной в буфер наблюдений
+# по правилу проекта. Границы прогона дописываются к каждой задаче.
+@test "runner_appends_process_boundaries_to_prompt" {
+  bin="$TMP/bin"; mkdir -p "$bin"
+  # стаб сохраняет полученный промпт: он приходит генератору на stdin
+  printf '#!/usr/bin/env bash\ncat > "%s/prompt-seen.txt"\nprintf "{}"\n' "$TMP" > "$bin/claude"
+  chmod +x "$bin/claude"
+  run env PATH="$bin:$PATH" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ -f "$TMP/prompt-seen.txt" ]
+  # тело задачи на месте
+  run grep -F 'добавить строку' "$TMP/prompt-seen.txt"
+  [ "$status" -eq 0 ]
+  # и границы поверх него
+  run grep -F 'буферы наблюдений' "$TMP/prompt-seen.txt"
+  [ "$status" -eq 0 ]
+  run grep -F 'Ничего не коммить' "$TMP/prompt-seen.txt"
+  [ "$status" -eq 0 ]
+}
+
+# Границы не должны оживлять пустой промпт: задача, которой нет в очереди,
+# обязана блокироваться, а не уходить генератору с одними границами.
+@test "runner_still_blocks_when_task_is_absent_from_queue" {
+  run "$ORC_ROOT/scripts/run-task.sh" "$CONF" nosuchtask
+  [ "$status" -eq 1 ]
+  run jq -rs 'map(select(.event=="prompt-empty")) | length' "$ORC_STATE/logs/nosuchtask/events.jsonl"
+  [ "$output" = "1" ]
+}

@@ -240,7 +240,9 @@ task_scope="$(jq -r --arg id "$task_id" 'select(.id == $id) | .scope // empty' \
 # --strict-mcp-config с пустым конфигом: MCP-серверы из ~/.claude.json пользователя (у владельца
 # четыре) грузили бы схемы тулов в контекст каждого прогона; боту они недоступны и не нужны.
 printf '{"mcpServers":{}}' > "$work/mcp-empty.json"
-default_gen="claude -p --output-format json --max-budget-usd $MAX_BUDGET_USD \
+# stream-json: строка на событие, результат последней строкой — дашборд читает ходы по мере записи
+# (замер 20.09: файл растёт построчно, без --verbose поток в -p не работает). Поля result те же.
+default_gen="claude -p --output-format stream-json --verbose --max-budget-usd $MAX_BUDGET_USD \
 --allowedTools $ALLOWED_TOOLS --permission-mode acceptEdits \
 --settings '{\"disableAllHooks\": true}' --strict-mcp-config --mcp-config '$work/mcp-empty.json'"
 gen_cmd="${ORC_GEN_CMD:-$default_gen}"
@@ -266,8 +268,9 @@ fi
 
 log_generator_result "$run_dir" "$task_id" "$gen_out"
 ui_ok "генератор"
-gen_cost="$(jq -r '.total_cost_usd // empty' "$gen_out" 2>/dev/null || true)"
-gen_turns="$(jq -r '.num_turns // empty' "$gen_out" 2>/dev/null || true)"
+gen_result="$(last_json_line "$gen_out")"
+gen_cost="$(printf '%s' "$gen_result" | jq -r '.total_cost_usd // empty' 2>/dev/null || true)"
+gen_turns="$(printf '%s' "$gen_result" | jq -r '.num_turns // empty' 2>/dev/null || true)"
 [ -n "$gen_cost" ] && ui_info "стоимость $gen_cost USD, ходов ${gen_turns:-?}"
 log_event "$run_dir" "$task_id" implement finished \
   "$(jq -cn --arg rc "$gen_rc" '{exit_code: $rc}')"
@@ -275,9 +278,9 @@ log_event "$run_dir" "$task_id" implement finished \
 # Ошибка генератора не должна читаться как «править было нечего».
 # Живой прогон 22.08: упор в --max-budget-usd на 4-м ходу дал пустой диф,
 # и задача была помечена done — успех, за которым нет работы.
-gen_err="$(jq -r '
+gen_err="$(printf '%s' "$gen_result" | jq -r '
   if (.is_error == true) or (((.subtype // "") | startswith("error")))
-  then (.subtype // "error") else empty end' "$gen_out" 2>/dev/null || true)"
+  then (.subtype // "error") else empty end' 2>/dev/null || true)"
 if [ -n "$gen_err" ]; then
   ui_outcome "agent-failed" "генератор завершился ошибкой: $gen_err"
   log_event "$run_dir" "$task_id" implement failed \

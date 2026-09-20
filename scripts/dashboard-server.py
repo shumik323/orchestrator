@@ -21,6 +21,9 @@ run_lock = threading.Lock()  # ThreadingHTTPServer: два клика подря
 # Наружу отдаются только эти пути: статика из корня целиком открывала /.git, /state/runs с промптами
 # и projects/*.local.conf (ревью 20.09). Всё остальное — 404.
 GET_ALLOWED = re.compile(r"^/(dashboard/[^/]*|queue/|queue/[^/]+\.jsonl|mr/[^/]+\.md|projects/|projects/[^/]+\.conf|state/logs/[^/]+/(events\.jsonl|scratch/[^/]+\.md|stdout/[^/]+))$")
+# Ходы бота из stream-json генератора: вызовы тулов по мере записи файла, без чтения его целиком
+# клиентом (init-строка одна весит ~8 KB, лог прогона — сотни KB).
+STEPS_RE = re.compile(r"^/state/logs/([A-Za-z0-9_.-]+)/steps\.json$")
 HOST_OK = re.compile(r"^(localhost|127\.0\.0\.1)(:\d+)?$")
 
 
@@ -43,9 +46,36 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(403, {"error": "Host не localhost"})
         if self.path in ("/", "/dashboard"):
             self.send_response(302); self.send_header("Location", "/dashboard/"); self.end_headers(); return
+        m = STEPS_RE.match(self.path.split("?", 1)[0])
+        if m:
+            return self.steps(m.group(1))
         if not GET_ALLOWED.match(self.path.split("?", 1)[0]):
             return self._json(404, {"error": "нет такого пути"})
         return super().do_GET()
+
+    def steps(self, tid):
+        path = os.path.join(STATE, "logs", tid, "stdout", "implement.log")
+        steps, done = [], False
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("type") == "assistant":
+                        for block in (ev.get("message") or {}).get("content") or []:
+                            if block.get("type") == "tool_use":
+                                inp = block.get("input") or {}
+                                target = inp.get("file_path") or inp.get("command") or inp.get("pattern") or inp.get("description") or ""
+                                steps.append({"tool": block.get("name", "?"), "target": str(target)[:160]})
+                    elif ev.get("type") == "result":
+                        done = True
+        except OSError:
+            pass  # лога ещё нет (фаза клона) или генератор старого формата — пустой список, не ошибка
+        return self._json(200, {"total": len(steps), "done": done, "last": steps[-8:]})
 
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()

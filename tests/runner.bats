@@ -106,6 +106,24 @@ GEN
   [ "$(jq -r 'select(.event=="result").payload.turns' "$ORC_STATE/logs/t1/events.jsonl")" = "3" ]
 }
 
+@test "stream_json_generator_yields_cost_and_turns_from_last_line" {
+  # Генератор с --output-format stream-json печатает строку на событие; результат — последняя,
+  # а у первой строки свой subtype (init), который не должен читаться как ошибка.
+  cat > "$TMP/gen.sh" <<'GEN'
+#!/bin/sh
+printf 'сделано\n' >> file.txt
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"file.txt"}}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.22,"num_turns":2,"session_id":"s1"}'
+GEN
+  chmod +x "$TMP/gen.sh"
+  run env ORC_GEN_CMD="$TMP/gen.sh" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.event=="result").payload.cost_usd' "$ORC_STATE/logs/t1/events.jsonl")" = "0.22" ]
+  [ "$(jq -r 'select(.event=="result").payload.turns' "$ORC_STATE/logs/t1/events.jsonl")" = "2" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+}
+
 @test "hooks_path_override_prevents_repo_hook_execution" {
   # Проверка самой техники, не раннера: если флаг назван неверно,
   # хук чужого репозитория исполнится при коммите.

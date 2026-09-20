@@ -115,3 +115,19 @@ post() {  # $1 action, $2 id, $3 extra curl args
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/api/ready" -H 'X-Orc: 1' --data "{\"conf\":\"$CONF\",\"id\":5}")"
   [ "$code" = "400" ]
 }
+
+@test "steps_endpoint_lists_tool_calls_from_stream_json" {
+  mkdir -p "$ORC_STATE/logs/t9/stdout"
+  printf '%s\n' '{"type":"system","subtype":"init"}' \
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/x/repo/a.md"}}]}}' \
+    'Warning: не json' \
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}' \
+    > "$ORC_STATE/logs/t9/stdout/implement.log"
+  run curl -s "http://127.0.0.1:$PORT/state/logs/t9/steps.json"
+  [ "$(printf '%s' "$output" | jq -r '.total')" = "2" ]
+  [ "$(printf '%s' "$output" | jq -r '.done')" = "false" ]
+  [ "$(printf '%s' "$output" | jq -r '.last[1].tool + " " + .last[1].target')" = "Bash ls" ]
+  # лога ещё нет — пустой список, не 404: карточка в фазе клона не должна краснеть
+  run curl -s "http://127.0.0.1:$PORT/state/logs/nope/steps.json"
+  [ "$(printf '%s' "$output" | jq -r '.total')" = "0" ]
+}

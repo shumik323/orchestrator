@@ -52,6 +52,8 @@
   .q.notes{border-left-color:var(--muted)}
   details.notes summary{cursor:pointer;color:var(--ink2);font-size:13px;margin-top:8px}
   details.notes[open] summary{margin-bottom:0}
+  .steps{margin-top:8px;font-size:13px;color:var(--ink2)} .steps b{color:var(--ink);font-weight:600}
+  .steps code{font-size:12px;padding:1px 4px;border-radius:4px;background:var(--surface);border:1px solid var(--ring)}
   .q ul{margin:0;padding-left:18px} .q li{margin:4px 0} .q li+li{margin-top:6px}
   .q code{font-size:12px;padding:1px 4px;border-radius:4px;background:var(--surface);border:1px solid var(--ring)}
   .q{margin-top:10px;padding:8px 10px;border-left:3px solid var(--serious);background:var(--plane);border-radius:0 6px 6px 0;white-space:pre-wrap;font-size:13px;max-height:180px;overflow:auto}
@@ -151,6 +153,7 @@ async function loadRuns(tasks) {
     if (s.question == null && s.outcome === 'blocked') s.question = await text(`/state/logs/${encodeURIComponent(t.id)}/scratch/NEEDS-OWNER.md`);
     // заметки бота по ходу — при любом исходе; нет файла → 404 → null
     s.notes = await text(`/state/logs/${encodeURIComponent(t.id)}/scratch/NOTES.md`);
+    try { s.steps = JSON.parse(await text(`/state/logs/${encodeURIComponent(t.id)}/steps.json`) || 'null'); } catch (e) { s.steps = null; }
     runs.push({task: t, ...s});
   }));
   return runs.sort((a, b) => (b.start || 0) - (a.start || 0));
@@ -199,6 +202,9 @@ function md(text) {
   return out + (list ? '</ul>' : '');
 }
 
+// Путь файла в клоне бота длинный и одинаковый у всех вызовов — показываем от корня репозитория.
+function shortTarget(t) { return (t || '').replace(/^.*\/repo\//, '').slice(0, 70); }
+
 const RETRY_FROM = new Set(['blocked', 'gate-failed', 'agent-failed', 'scope-violation']);
 // Состояние кнопок живёт здесь, не в DOM: таблица перерисовывается на каждом изменении,
 // и текст, записанный прямо в узел, пропал бы на следующем тике.
@@ -246,6 +252,7 @@ function render(tasks, runs) {
       ${r.outcome === 'done' ? `<a href="/mr/${encodeURIComponent(r.task.id)}.md">MR</a>` : ''}
       <a href="/state/logs/${encodeURIComponent(r.task.id)}/events.jsonl">jsonl</a></header>`,
       bar: `<div class="bar" role="img" aria-label="фазы: ${esc(barLabel)}">${bar}</div><div class="legend">${legend}</div>`,
+      steps: r.steps && r.steps.total ? `<div class="steps"><b>вызовов тулов: ${r.steps.total}</b>${r.steps.done ? '' : ' · идёт'} · ${r.steps.last.slice(-4).map(st => `<code>${esc(st.tool)}</code> ${esc(shortTarget(st.target))}`).join(' · ')}</div>` : '',
       q: r.question ? `<div class="q"><b>Нужен ответ:</b> ${md(r.question.trim().slice(0, 1500))}</div>` : '',
       notes: r.notes ? `<details class="notes"><summary>заметки бота (${r.notes.trim().split('\n').filter(Boolean).length})</summary><div class="q notes">${md(r.notes.trim().slice(0, 1500))}</div></details>` : ''
     }};

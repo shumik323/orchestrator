@@ -119,7 +119,7 @@ cat > ~/Library/LaunchAgents/local.orchestrator.dashboard.plist <<'EOF'
   <key>Label</key><string>local.orchestrator.dashboard</string>
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>-c</string>
-    <string>cd "$HOME/Desktop/orchestrator" && exec ./scripts/dashboard.sh 8765</string>
+    <string>cd "$HOME/Desktop/orchestrator" &amp;&amp; exec ./scripts/dashboard.sh 8765</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -133,6 +133,12 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.orchestrator.das
 
 `KeepAlive` перезапускает сервер после падения; путь к репозиторию в plist — свой. Проверка после
 логина: `curl -s -o /dev/null -w '%{http_code}' http://localhost:8765/dashboard/` → `200`.
+
+Репозиторий лежит в `~/Desktop` (или `~/Documents`) → агент упадёт с `Operation not permitted`
+и будет перезапускаться каждые 10 секунд: фоновым процессам launchd macOS не даёт доступ к этим
+каталогам без разрешения (замер 20.09). Два выхода: дать `/bin/sh` доступ в System Settings →
+Privacy & Security → Full Disk Access, либо держать репозиторий вне защищённых каталогов.
+Снять агент: `launchctl bootout "gui/$(id -u)/local.orchestrator.dashboard"`.
 
 
 Прогресс печатается в stderr, путь к результату — в stdout. Вывод читается глазами и разбирается скриптом одновременно.

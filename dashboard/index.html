@@ -52,6 +52,8 @@
   .q.notes{border-left-color:var(--muted)}
   details.notes summary{cursor:pointer;color:var(--ink2);font-size:13px;margin-top:8px}
   details.notes[open] summary{margin-bottom:0}
+  .q ul{margin:0;padding-left:18px} .q li{margin:4px 0} .q li+li{margin-top:6px}
+  .q code{font-size:12px;padding:1px 4px;border-radius:4px;background:var(--surface);border:1px solid var(--ring)}
   .q{margin-top:10px;padding:8px 10px;border-left:3px solid var(--serious);background:var(--plane);border-radius:0 6px 6px 0;white-space:pre-wrap;font-size:13px;max-height:180px;overflow:auto}
   a{color:var(--p1)}
   button{font:inherit;font-size:12px;padding:3px 9px;border:1px solid var(--ring);border-radius:6px;background:var(--surface);color:var(--ink);cursor:pointer}
@@ -183,6 +185,20 @@ function putCards(id, cards, emptyHtml) {
   for (const el of have.values()) el.remove();
 }
 
+// Заметки и вопрос бота пишутся markdown-ом: код в обратных кавычках, списки, жирный. Без рендера
+// читатель видит сырые кавычки и звёздочки. Полный парсер не нужен — три конструкции.
+function md(text) {
+  const inline = t => esc(t).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  let out = '', list = false;
+  for (const line of text.split('\n')) {
+    const m = line.match(/^\s*[-*]\s+(.*)$/);
+    if (m) { if (!list) { out += '<ul>'; list = true; } out += `<li>${inline(m[1])}</li>`; continue; }
+    if (list) { out += '</ul>'; list = false; }
+    out += inline(line) + '\n';
+  }
+  return out + (list ? '</ul>' : '');
+}
+
 const RETRY_FROM = new Set(['blocked', 'gate-failed', 'agent-failed', 'scope-violation']);
 // Состояние кнопок живёт здесь, не в DOM: таблица перерисовывается на каждом изменении,
 // и текст, записанный прямо в узел, пропал бы на следующем тике.
@@ -230,8 +246,8 @@ function render(tasks, runs) {
       ${r.outcome === 'done' ? `<a href="/mr/${encodeURIComponent(r.task.id)}.md">MR</a>` : ''}
       <a href="/state/logs/${encodeURIComponent(r.task.id)}/events.jsonl">jsonl</a></header>`,
       bar: `<div class="bar" role="img" aria-label="фазы: ${esc(barLabel)}">${bar}</div><div class="legend">${legend}</div>`,
-      q: r.question ? `<div class="q"><b>Нужен ответ:</b> ${esc(r.question.trim().slice(0, 1500))}</div>` : '',
-      notes: r.notes ? `<details class="notes"><summary>заметки бота (${r.notes.trim().split('\n').filter(Boolean).length})</summary><div class="q notes">${esc(r.notes.trim().slice(0, 1500))}</div></details>` : ''
+      q: r.question ? `<div class="q"><b>Нужен ответ:</b> ${md(r.question.trim().slice(0, 1500))}</div>` : '',
+      notes: r.notes ? `<details class="notes"><summary>заметки бота (${r.notes.trim().split('\n').filter(Boolean).length})</summary><div class="q notes">${md(r.notes.trim().slice(0, 1500))}</div></details>` : ''
     }};
   }), `<div class="empty">прогонов ещё нет</div>`);
   firstRender = false;

@@ -7,6 +7,8 @@
 #     desktop=1440x1000:docs/specs/belleza-hero/figma-desktop.jpg \
 #     mobile=490x1000:docs/specs/belleza-hero/figma-mobile.jpg
 # Нужны: Google Chrome, python3 с Pillow и numpy. Страница должна быть уже поднята (любой http).
+# CMP_WRAP_BASE — http-адрес каталога <outdir>, если он раздаётся тем же сервером, что и страница:
+# тогда обёртка same-origin и может выключить анимации внутри iframe; без него — file:// и анимации бегут.
 # Порог «заметной разницы» — DIFF_THRESHOLD (0–255, по умолчанию 40) после блюра 1px: гасит шум
 # антиалиасинга, но оставляет сдвиги в 1–2px как контуры — их и надо смотреть глазами.
 set -u
@@ -23,9 +25,17 @@ for spec in "$@"; do
   [ -f "$ref" ] || { printf 'нет кадра %s\n' "$ref" >&2; exit 2; }
   cp "$ref" "$OUT/figma/$name.${ref##*.}"
   shot="$OUT/render/$name.png"; rm -f "$shot"
-  # --screenshot в headless=new не всегда завершает процесс: ждём файл, потом убиваем.
+  # Chrome клампит окно к ширине ≥ 500 (замер 20.09: --window-size=490 → innerWidth 500, страница
+  # свёрстана на 500 и обрезана), поэтому страница рендерится в iframe нужной ширины внутри
+  # окна ≥ 520, а скрин кропается до w×h ниже в python.
+  wrap="$OUT/render/wrap-$name.html"
+  # Анимации в кадре стоят, а в рендере бегут (marquee уехал за 8 с виртуального времени): для диффа
+  # ставим их на паузу в нулевом кадре; работает только для same-origin страницы, иначе молча нет.
+  printf '<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;background:#fff}iframe{display:block;border:0}</style></head><body><iframe src="%s" width="%s" height="%s" onload="try{var d=this.contentDocument,s=d.createElement(\x27style\x27);s.textContent=\x27*,*::before,*::after{animation:none!important}\x27;d.head.appendChild(s)}catch(e){}"></iframe></body></html>' "$URL" "$w" "$h" > "$wrap"
+  ww=$(( w < 520 ? 520 : w ))
+  if [ -n "${CMP_WRAP_BASE:-}" ]; then wrap_url="$CMP_WRAP_BASE/render/wrap-$name.html"; else wrap_url="file://$wrap"; fi
   "$CHROME" --headless=new --disable-gpu --hide-scrollbars --user-data-dir="$OUT/.chrome-$name" \
-    --window-size="${w},${h}" --virtual-time-budget=6000 --screenshot="$shot" "$URL" >/dev/null 2>&1 &
+    --window-size="${ww},${h}" --virtual-time-budget=8000 --screenshot="$shot" "$wrap_url" >/dev/null 2>&1 &
   pid=$!
   for _ in $(seq 1 40); do [ -s "$shot" ] && break; sleep 1; done
   sleep 1; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
@@ -40,6 +50,7 @@ out = sys.argv[1]; thr = int(os.environ.get("DIFF_THRESHOLD", "40")); stats = {}
 for line in open(f"{out}/manifest.txt"):
     name, w, h, ref = line.split(); w, h = int(w), int(h)
     r = Image.open(f"{out}/render/{name}.png").convert("RGB")
+    if r.size != (w, h): r = r.crop((0, 0, w, h))  # окно шире iframe — кроп до кадра
     f = Image.open(f"{out}/{ref}").convert("RGB")
     if f.size != r.size: f = f.resize(r.size)
     a = np.asarray(r.filter(ImageFilter.GaussianBlur(1)), dtype=np.int16)

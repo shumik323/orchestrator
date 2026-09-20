@@ -67,7 +67,7 @@ refs_in_target() {
   [ "$status" -ne 0 ]
   [ -z "$(refs_in_target)" ]
   [ ! -f "$TMP/mr/t1.md" ]
-  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "agent-failed" ]
   run jq -rs 'map(.event) | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
   [[ "$output" == *"timeout"* ]]
 }
@@ -136,7 +136,7 @@ GEN
   [ "$status" -ne 0 ]
   [ ! -f "$TMP/mr/t1.md" ]
   [ -z "$(refs_in_target)" ]
-  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "agent-failed" ]
   run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
   [[ "$output" == *"implement:failed"* ]]
 }
@@ -173,7 +173,7 @@ EOF
   [ "$status" -ne 0 ]
   [ ! -f "$TMP/mr/t1.md" ]
   [ -z "$(refs_in_target)" ]
-  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "scope-violation" ]
   run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
   [[ "$output" == *"scope:readonly-violation"* ]]
 }
@@ -398,7 +398,10 @@ EOF
   run grep -F 'добавить строку' "$TMP/prompt-seen.txt"
   [ "$status" -eq 0 ]
   # и границы поверх него
-  run grep -F 'буферы наблюдений' "$TMP/prompt-seen.txt"
+  run grep -F 'Буферы наблюдений' "$TMP/prompt-seen.txt"
+  [ "$status" -eq 0 ]
+  # и адрес для записей вне задачи — каталог из NEEDS_OWNER_FILE
+  run grep -F '_scratch/NOTES.md' "$TMP/prompt-seen.txt"
   [ "$status" -eq 0 ]
   run grep -F 'Ничего не коммить' "$TMP/prompt-seen.txt"
   [ "$status" -eq 0 ]
@@ -411,4 +414,108 @@ EOF
   [ "$status" -eq 1 ]
   run jq -rs 'map(select(.event=="prompt-empty")) | length' "$ORC_STATE/logs/nosuchtask/events.jsonl"
   [ "$output" = "1" ]
+}
+
+# Канал «сделал, но с вопросом»: файл в рабочем каталоге, не текст result.
+# Прогон 18.09 (kingfin): бот выдумал копирайт, признался в result, а раннер читал только дифф и гейт.
+@test "needs_owner_file_blocks_task_before_gate_and_push" {
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt; mkdir -p _scratch; printf \"NEEDS-OWNER: нет копирайта, чей текст?\" > _scratch/NEEDS-OWNER.md'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map(select(.event=="needs-owner")) | .[0].payload.question' "$ORC_STATE/logs/t1/events.jsonl"
+  [ "$output" = "NEEDS-OWNER: нет копирайта, чей текст?" ]
+  [ -s "$ORC_STATE/logs/t1/scratch/NEEDS-OWNER.md" ]
+}
+
+@test "empty_needs_owner_file_is_not_a_question" {
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt; mkdir -p _scratch; : > _scratch/NEEDS-OWNER.md'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ -n "$(refs_in_target)" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+}
+
+# Вторичный сигнал: AskUserQuestion в -p отклоняется молча и оседает в permission_denials result.
+@test "permission_denials_in_result_blocks_task" {
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt; printf \"%s\" \"{\\\"result\\\":\\\"готово\\\",\\\"permission_denials\\\":[{\\\"tool_name\\\":\\\"AskUserQuestion\\\"}]}\"'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map(select(.event=="permission-denied")) | .[0].payload.denials[0].tool_name' "$ORC_STATE/logs/t1/events.jsonl"
+  [ "$output" = "AskUserQuestion" ]
+}
+
+# Заметки бота уносятся в лог прогона при любом исходе, не только при вопросе владельцу.
+@test "scratch_notes_are_copied_to_run_log_on_done" {
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt; mkdir -p _scratch; printf \"%s\" \"- заметка бота\" > _scratch/NOTES.md'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+  [ "$(cat "$ORC_STATE/logs/t1/scratch/NOTES.md")" = "- заметка бота" ]
+  run jq -rs 'map(select(.event=="scratch")) | .[0].payload.files | join(",")' "$ORC_STATE/logs/t1/events.jsonl"
+  [ "$output" = "NOTES.md" ]
+}
+
+# Ревью 20.09: старый NEEDS-OWNER.md переживал clean без -x, повтор снова вставал тем же вопросом.
+@test "stale_scratch_is_removed_before_rerun" {
+  run env ORC_GEN_CMD="sh -c 'mkdir -p _scratch; printf \"%s\" \"NEEDS-OWNER: вопрос\" > _scratch/NEEDS-OWNER.md'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  . "$ORC_ROOT/scripts/lib/queue.sh"; queue_set_status "$QUEUE" t1 ready
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+}
+
+# Ревью 20.09: отказ перехода → running не останавливал прогон; задача в blocked доходила до MR.
+@test "runner_refuses_to_start_task_not_in_ready" {
+  printf '%s\n' '{"id":"t9","title":"x","body":"x","status":"blocked","schema_version":1}' >> "$QUEUE"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t9
+  [ "$status" -eq 3 ]
+  [ -z "$(git -C "$TMP/target.git" for-each-ref 'refs/heads/orc/t9')" ]
+  [ ! -f "$TMP/mr/t9.md" ]
+  [ "$(jq -r 'select(.id=="t9").status' "$QUEUE")" = "blocked" ]
+}
+
+# _scratch/ — канал, не правка: в ветку не попадает даже без .gitignore у таргета.
+@test "scratch_dir_is_neither_scope_violation_nor_committed" {
+  cat >> "$CONF" <<EOC
+WRITE_SCOPE="file.txt"
+EOC
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt; mkdir -p _scratch; printf \"%s\" \"- заметка\" > _scratch/NOTES.md'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+  run git -C "$TMP/target.git" ls-tree -r --name-only refs/heads/orc/t1
+  [[ "$output" != *"_scratch"* ]]
+}
+
+@test "runner_passes_strict_mcp_config_to_generator" {
+  bin="$TMP/bin"; mkdir -p "$bin"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" > "%s/claude-args.txt"\nprintf "{}"\n' "$TMP" > "$bin/claude"
+  chmod +x "$bin/claude"
+  run env PATH="$bin:$PATH" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  run grep -F -- '--strict-mcp-config' "$TMP/claude-args.txt"
+  [ "$status" -eq 0 ]
+}
+
+# Только AskUserQuestion — вопрос владельцу; отказ другого тула (WebFetch) в статус не идёт.
+@test "other_permission_denials_do_not_block" {
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt; printf \"%s\" \"{\\\"result\\\":\\\"ok\\\",\\\"permission_denials\\\":[{\\\"tool_name\\\":\\\"WebFetch\\\"}]}\"'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+}
+
+# Сообщение коммита — из конфига проекта: у инстансов свои хуки формата, в клон они не приезжают.
+@test "commit_message_follows_project_template" {
+  printf 'COMMIT_MSG_TEMPLATE="MD-0000: {title} [{id}]"\n' >> "$CONF"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  run git -C "$TMP/target.git" log -1 --format=%s refs/heads/orc/t1
+  [ "$output" = "MD-0000: проба [t1]" ]
 }

@@ -4,3 +4,5 @@
 projects/*.local.conf
 mr/
 queue/*.jsonl
+state
+__pycache__/

@@ -14,24 +14,108 @@
 queue_ready() {
   local qf="${1:?queue_ready <queue-file>}"
   jq -rs '
-    (map(select(.status == "done") | .id)) as $done
+    (map(select(.status == "done" or .status == "no-change") | .id)) as $done
     | map(select(.status == "ready")
           | select((((.blocked_by // []) - $done)) | length == 0)
           | .id)
     | .[]' "$qf"
 }
 
+# Состояния Work и разрешённые переходы.
+#
+# Статусы различимы по тому, ЧТО делать дальше, а не по тому, где упало:
+#   done            работа принята, ветка есть
+#   no-change       правка не потребовалась — это исход, а не успех «ничего»
+#   gate-failed     агент отработал, проверки красные → перезапуск или доработка
+#   scope-violation агент вышел за границы → разбирать промпт и область
+#   agent-failed    генератор упал, завис или упёрся в бюджет → перезапуск
+#   blocked         системная проблема (клон, push, MR, пустой промпт) → рука человека
+#
+# Недопустимый переход — явная ошибка, а не тихая правка поля: состояние,
+# записанное в обход автомата, делает очередь недостоверной, и дальше система
+# врёт о себе молча.
+QUEUE_STATES="ready running done no-change gate-failed scope-violation agent-failed blocked"
+
+queue_transitions() {
+  cat <<'EOF'
+ready:running
+running:done no-change gate-failed scope-violation agent-failed blocked
+gate-failed:ready running
+agent-failed:ready running
+scope-violation:ready
+blocked:ready
+EOF
+}
+
+queue_status_of() {
+  local qf="${1:?queue_status_of <queue-file> <id>}" id="${2:?id}"
+  jq -r --arg id "$id" 'select(.id == $id) | .status // empty' "$qf" 2>/dev/null | tail -1
+}
+
+queue_is_state() {
+  local st="${1:?}" known
+  for known in $QUEUE_STATES; do
+    [ "$st" = "$known" ] && return 0
+  done
+  return 1
+}
+
+# Повтор того же статуса разрешён: операция идемпотентна.
+queue_transition_allowed() {
+  local from="${1:?}" to="${2:?}" line allowed st
+  [ "$from" = "$to" ] && return 0
+  line="$(queue_transitions | grep "^${from}:" || true)"
+  [ -n "$line" ] || return 1
+  allowed="${line#*:}"
+  for st in $allowed; do
+    [ "$st" = "$to" ] && return 0
+  done
+  return 1
+}
+
 queue_set_status() {
   local qf="${1:?queue_set_status <queue-file> <id> <status>}"
-  local id="${2:?id}" st="${3:?status}" tmp
+  local id="${2:?id}" st="${3:?status}" tmp current
+  if ! queue_is_state "$st"; then
+    printf 'queue_set_status: неизвестный статус "%s"; известны: %s\n' "$st" "$QUEUE_STATES" >&2
+    return 3
+  fi
+  current="$(queue_status_of "$qf" "$id")"
+  if [ -z "$current" ]; then
+    printf 'queue_set_status: задачи %s нет в очереди\n' "$id" >&2
+    return 4
+  fi
+  if ! queue_transition_allowed "$current" "$st"; then
+    printf 'queue_set_status: недопустимый переход %s → %s для %s\n' "$current" "$st" "$id" >&2
+    return 3
+  fi
+  # Лок единственного писателя: read-modify-write без него терял статусы при параллельных
+  # прогонах (ревью 20.09: 40 записей → выжило 6). mkdir атомарен, flock на macOS нет.
+  local lock="${qf}.lock" waited=0
+  until mkdir "$lock" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt 100 ]; then
+      printf 'queue_set_status: очередь занята дольше 10 с (%s) — запись отменена\n' "$lock" >&2
+      return 5
+    fi
+    sleep 0.1
+  done
+  # текущее состояние перечитываем под локом: снаружи оно могло смениться
+  current="$(queue_status_of "$qf" "$id")"
+  if ! queue_transition_allowed "$current" "$st"; then
+    rmdir "$lock"
+    printf 'queue_set_status: недопустимый переход %s → %s для %s\n' "$current" "$st" "$id" >&2
+    return 3
+  fi
   tmp="$(mktemp "${qf}.XXXXXX")"
-  jq -c --arg id "$id" --arg st "$st" \
-    'if .id == $id then .status = $st else . end' "$qf" > "$tmp" || {
-      rm -f "$tmp"
+  if ! jq -c --arg id "$id" --arg st "$st" \
+    'if .id == $id then .status = $st else . end' "$qf" > "$tmp"; then
+      rm -f "$tmp"; rmdir "$lock"
       printf 'queue_set_status: jq не разобрал очередь, файл не изменён\n' >&2
       return 1
-    }
+  fi
   mv "$tmp" "$qf"
+  rmdir "$lock"
 }
 
 # Счётчик попыток. Отсутствующее поле считается нулём: задачи, положенные

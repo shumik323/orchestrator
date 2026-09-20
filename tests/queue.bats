@@ -19,6 +19,7 @@ setup() {
 }
 
 @test "queue_set_status_changes_one_line_and_keeps_count" {
+  bash -c ". '$LIB'; queue_set_status '$Q' t4 running"
   run bash -c ". '$LIB'; queue_set_status '$Q' t4 done"
   [ "$status" -eq 0 ]
   [ "$(wc -l < "$Q" | tr -d ' ')" = "5" ]
@@ -27,6 +28,7 @@ setup() {
 }
 
 @test "queue_set_status_is_idempotent" {
+  bash -c ". '$LIB'; queue_set_status '$Q' t4 running"
   bash -c ". '$LIB'; queue_set_status '$Q' t4 done"
   first="$(cat "$Q")"
   bash -c ". '$LIB'; queue_set_status '$Q' t4 done"
@@ -64,6 +66,7 @@ setup() {
 
 @test "queue_add_allows_same_prompt_after_task_closed" {
   bash -c ". '$LIB'; queue_add '$Q' t6 'новая' 'тело задачи'"
+  bash -c ". '$LIB'; queue_set_status '$Q' t6 running"
   bash -c ". '$LIB'; queue_set_status '$Q' t6 done"
   run bash -c ". '$LIB'; queue_add '$Q' t7 'новая' 'тело задачи'"
   [ "$status" -eq 0 ]
@@ -76,4 +79,53 @@ setup() {
   run bash -c ". '$LIB'; queue_set_status '$Q' t2 done"
   [ "$status" -ne 0 ]
   [ "$(cat "$Q")" = "$before" ]
+}
+
+@test "fsm_rejects_transition_that_skips_running" {
+  before="$(cat "$Q")"
+  run bash -c ". '$LIB'; queue_set_status '$Q' t4 done"
+  [ "$status" -eq 3 ]
+  [ "$(cat "$Q")" = "$before" ]
+}
+
+@test "fsm_rejects_unknown_status" {
+  run bash -c ". '$LIB'; queue_set_status '$Q' t4 наверное-готово"
+  [ "$status" -eq 3 ]
+}
+
+@test "fsm_rejects_unknown_task_id" {
+  run bash -c ". '$LIB'; queue_set_status '$Q' t99 running"
+  [ "$status" -eq 4 ]
+}
+
+@test "fsm_allows_retry_path_from_gate_failed_to_ready" {
+  bash -c ". '$LIB'; queue_set_status '$Q' t4 running"
+  bash -c ". '$LIB'; queue_set_status '$Q' t4 gate-failed"
+  run bash -c ". '$LIB'; queue_set_status '$Q' t4 ready"
+  [ "$status" -eq 0 ]
+}
+
+@test "fsm_keeps_terminal_states_terminal" {
+  bash -c ". '$LIB'; queue_set_status '$Q' t4 running"
+  bash -c ". '$LIB'; queue_set_status '$Q' t4 done"
+  run bash -c ". '$LIB'; queue_set_status '$Q' t4 running"
+  [ "$status" -eq 3 ]
+}
+
+@test "queue_ready_counts_no_change_as_closed_blocker" {
+  # t2 заблокирован t1; t1 закрыт как no-change — работа по нему окончена
+  cp "$ORC_ROOT/tests/fixtures/queue-5.jsonl" "$Q"
+  bash -c ". '$LIB'; queue_set_status '$Q' t1 ready" 2>/dev/null || true
+  run bash -c ". '$LIB'; queue_ready '$Q'"
+  [[ "$output" == *"t2"* ]]
+}
+
+# Ревью 20.09: без лока 40 параллельных записей оставляли 6. mkdir-лок — все 40.
+@test "parallel_status_writes_are_not_lost" {
+  qf="$TMP/par.jsonl"; : > "$qf"
+  for i in $(seq 1 40); do printf '{"id":"p%s","title":"x","body":"x","status":"ready","schema_version":1}\n' "$i" >> "$qf"; done
+  for i in $(seq 1 40); do ( . "$ORC_ROOT/scripts/lib/queue.sh"; queue_set_status "$qf" "p$i" running ) & done
+  wait
+  [ "$(jq -r 'select(.status=="running") | .id' "$qf" | wc -l | tr -d ' ')" = "40" ]
+  [ ! -d "$qf.lock" ]
 }

@@ -60,3 +60,23 @@ ui_done() {
   printf '%s  ╰─ ✓ %s%s %s(всего %sс)%s\n' \
     "$UI_GREEN" "${1:-}" "$UI_RESET" "$UI_DIM" "$((SECONDS - UI_T0))" "$UI_RESET" >&2
 }
+
+# Закрывающая строка прогона. Знак и цвет выбираются по исходу, а текст
+# исхода совпадает со статусом в очереди: то, что видно в терминале, и то,
+# что записано в состоянии, должно называться одинаково.
+ui_outcome() {
+  local status="${1:-blocked}" text="${2:-}" sign color hint=""
+  case "$status" in
+    done)            sign='✓'; color="$UI_GREEN" ;;
+    no-change)       sign='='; color="$UI_DIM" ;;
+    gate-failed)     sign='✗'; color="$UI_YELLOW" ;;
+    scope-violation) sign='⊘'; color="$UI_YELLOW" ;;
+    agent-failed)    sign='✗'; color="$UI_RED" ;;
+    blocked)         sign='■'; color="$UI_RED"; hint=' — нужна рука' ;;
+    *)               sign='?'; color="$UI_RED" ;;
+  esac
+  printf '%s  ╰─ %s %s%s %s[%s%s]%s %s(всего %sс)%s\n' \
+    "$color" "$sign" "$text" "$UI_RESET" \
+    "$UI_DIM" "$status" "$hint" "$UI_RESET" \
+    "$UI_DIM" "$((SECONDS - UI_T0))" "$UI_RESET" >&2
+}

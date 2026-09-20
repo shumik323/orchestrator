@@ -52,6 +52,8 @@ esac
 : "${WRITE_SCOPE:=}"
 : "${SETUP_CMD:=}"
 : "${SETUP_MARKER:=node_modules}"
+: "${NEEDS_OWNER_FILE:=_scratch/NEEDS-OWNER.md}"
+: "${COMMIT_MSG_TEMPLATE:=orc({id}): автоматическая правка}"
 
 orc_init_state
 work="$(orc_task_dir "$task_id")"
@@ -66,17 +68,40 @@ g() { git -c core.hooksPath="$work/nohooks" -c core.quotePath=false "$@"; }
 # приходится срезать, кириллица приезжает в эскейпах, а переименование печатается
 # одной строкой «старое -> новое» — три способа проскочить проверку зон.
 changed_paths() {
-  g -C "$work/repo" diff --name-only --no-renames HEAD || return 1
-  g -C "$work/repo" ls-files --others --exclude-standard || return 1
+  # _scratch/ — канал бота, а не правка: исключаем сами, не полагаясь на .gitignore таргета
+  { g -C "$work/repo" diff --name-only --no-renames HEAD || return 1
+    g -C "$work/repo" ls-files --others --exclude-standard || return 1
+  } | grep -v "^$(dirname "$NEEDS_OWNER_FILE")/" || true
 }
 
+# Инвариант обязан падать громко. Прогон не прерываем — его исход уже
+# определён, а артефакты нужны для разбора, — но недопустимый переход
+# попадает и в stderr, и в лог событий, а не теряется молча.
 set_status() {
-  [ -n "$QUEUE_FILE" ] && [ -f "$QUEUE_FILE" ] && queue_set_status "$QUEUE_FILE" "$task_id" "$1"
+  [ -n "$QUEUE_FILE" ] && [ -f "$QUEUE_FILE" ] || return 0
+  if ! queue_set_status "$QUEUE_FILE" "$task_id" "$1"; then
+    printf 'состояние очереди не обновлено: недопустимый переход в %s\n' "$1" >&2
+    log_event "$run_dir" "$task_id" state invalid-transition \
+      "$(jq -cn --arg to "$1" '{to: $to}')"
+  fi
   return 0
 }
 
 branch="$BRANCH_PREFIX/$task_id"
 
+# Раннер взял задачу — с этого момента любой исход достижим. Раньше переход
+# стоял перед вызовом генератора, и сбой на клоне или setup оставлял задачу
+# в ready, откуда терминального статуса нет.
+# Первый переход — предусловие, не исход: задача не в ready (blocked, done, running) не
+# запускается вовсе. Ревью 20.09: раннер печатал invalid-transition и шёл до MR, очередь врала.
+# Задачи нет в очереди вовсе — отдельный путь ниже (prompt-empty), здесь только известная задача.
+if [ -n "$QUEUE_FILE" ] && [ -f "$QUEUE_FILE" ] && [ -n "$(queue_status_of "$QUEUE_FILE" "$task_id")" ] \
+   && ! queue_set_status "$QUEUE_FILE" "$task_id" running; then
+  log_event "$run_dir" "$task_id" state refused-start
+  printf 'задача %s не в ready — прогон не начат (статус: %s)\n' \
+    "$task_id" "$(queue_status_of "$QUEUE_FILE" "$task_id")" >&2
+  exit 3
+fi
 ui_task "$task_id" "$branch → $BASE_BRANCH"
 ui_phase "клон $BASE_BRANCH"
 log_event "$run_dir" "$task_id" clone started
@@ -97,6 +122,15 @@ g -C "$work/repo" fetch -q origin "$BASE_BRANCH"
 g -C "$work/repo" checkout -q -B "$branch" "origin/$BASE_BRANCH"
 g -C "$work/repo" reset -q --hard "origin/$BASE_BRANCH"
 g -C "$work/repo" clean -qfd
+# Канал бота — игнорируемый каталог, clean без -x его бережёт: старый NEEDS-OWNER.md блокировал
+# бы повтор тем же вопросом после ответа владельца (ревью 20.09). Только подкаталог: dirname
+# «.» означал бы весь клон.
+scratch_rel="$(dirname "$NEEDS_OWNER_FILE")"
+if [ "$scratch_rel" = . ] || [ -z "$scratch_rel" ]; then
+  printf 'NEEDS_OWNER_FILE обязан лежать в подкаталоге (сейчас: %s)\n' "$NEEDS_OWNER_FILE" >&2
+  exit 3
+fi
+rm -rf "${work:?}/repo/$scratch_rel"
 g -C "$work/repo" config user.email "orchestrator@local"
 g -C "$work/repo" config user.name "orchestrator"
 # Шаг 1. Гейт и зоны принадлежат инстансу: держать их копию в конфиге раннера
@@ -164,16 +198,19 @@ fi
 # оставляем. Дальше он их честно исполняет, а для петли запись в такой файл это
 # выход за область и потеря всей сделанной работы.
 # Прогон 25.08: готовая правка на $1.89 заблокирована одной строкой, дописанной
-# в .claude/PENDING-NOTES.md по правилу репозитория.
+# в .claude/PENDING-NOTES.md по правилу репозитория. Прогон 18.09: с запретом «не заводи файлы»
+# бот оставил два наблюдения в итоговом ответе, который раннер не читает, — отсюда _scratch/.
 # Дописываются ПОСЛЕ тела задачи: последняя инструкция весит больше в длинном промпте.
 if [ -s "$work/prompt.txt" ]; then
   {
     printf '\n\n---\n\n'
     printf 'Границы прогона. Это указания раннера, и они сильнее процессных правил репозитория:\n'
-    printf -- '- Не веди буферы наблюдений и заметок, не дописывай логи проекта, не заводи отчётные файлы.\n'
+    printf -- '- Буферы наблюдений и логи проекта не трогай: запись туда попадает в дифф и отменяет прогон.\n'
     printf -- '- Ничего не коммить и не пушить: ветку и коммит делает раннер сам.\n'
     printf -- '- Правь только файлы, названные в задаче. Один лишний файл в диффе отменяет весь прогон.\n'
-    printf -- '- Всё, что заметил по ходу, отдай итоговым ответом — его читает человек.\n'
+    printf -- '- Единственное место для записей вне задачи — каталог %s/ (в дифф не попадает, раннер уносит его в лог прогона):\n' "$scratch_rel"
+    printf -- '  заметки по ходу — %s/NOTES.md, по строке на заметку; нужен ответ владельца — %s, первая строка «NEEDS-OWNER: чего не хватает», тогда файлы задачи не правь.\n' "$scratch_rel" "$NEEDS_OWNER_FILE"
+    printf -- '- Итоговый ответ раннер не читает: что не записано в %s/, человек не увидит.\n' "$scratch_rel"
   } >> "$work/prompt.txt"
 fi
 
@@ -182,7 +219,7 @@ fi
 # Проверка идёт ПОСЛЕ дописывания границ, но смотрит на исходное тело: границы
 # добавляются только к непустому промпту, иначе они сами сделали бы файл непустым.
 if [ ! -s "$work/prompt.txt" ]; then
-  ui_fail "промпт пуст: задачи $task_id нет в очереди"
+  ui_outcome "blocked" "промпт пуст: задачи $task_id нет в очереди"
   log_event "$run_dir" "$task_id" implement prompt-empty
   set_status "blocked"
   exit 1
@@ -200,13 +237,15 @@ task_scope="$(jq -r --arg id "$task_id" 'select(.id == $id) | .scope // empty' \
 # project целиком, а вместе с ним CLAUDE.md репозитория — правила проекта боту
 # нужны. Замер 25.08: с этим флагом ошибка SessionEnd исчезает, а ответ про
 # правила проекта приходит без единого обращения к файлам.
+# --strict-mcp-config с пустым конфигом: MCP-серверы из ~/.claude.json пользователя (у владельца
+# четыре) грузили бы схемы тулов в контекст каждого прогона; боту они недоступны и не нужны.
+printf '{"mcpServers":{}}' > "$work/mcp-empty.json"
 default_gen="claude -p --output-format json --max-budget-usd $MAX_BUDGET_USD \
 --allowedTools $ALLOWED_TOOLS --permission-mode acceptEdits \
---settings '{\"disableAllHooks\": true}'"
+--settings '{\"disableAllHooks\": true}' --strict-mcp-config --mcp-config '$work/mcp-empty.json'"
 gen_cmd="${ORC_GEN_CMD:-$default_gen}"
 gen_out="$(log_phase_stdout "$run_dir" implement)"
 
-set_status "running"
 ui_phase "генератор, дедлайн ${DEADLINE_SEC}с"
 log_event "$run_dir" "$task_id" implement started \
   "$(jq -cn --arg d "$DEADLINE_SEC" '{deadline_sec: $d}')"
@@ -216,10 +255,10 @@ run_with_deadline "$DEADLINE_SEC" \
 gen_rc=$?
 
 if [ "$gen_rc" -eq 124 ]; then
-  ui_fail "генератор не уложился в ${DEADLINE_SEC}с"
+  ui_outcome "agent-failed" "генератор не уложился в ${DEADLINE_SEC}с"
   log_event "$run_dir" "$task_id" implement timeout \
     "$(jq -cn --arg d "$DEADLINE_SEC" '{deadline_sec: $d}')"
-  set_status "blocked"
+  set_status "agent-failed"
   printf 'генератор не уложился в %s с — задача blocked, каталог %s оставлен\n' \
     "$DEADLINE_SEC" "$work" >&2
   exit 1
@@ -240,12 +279,56 @@ gen_err="$(jq -r '
   if (.is_error == true) or (((.subtype // "") | startswith("error")))
   then (.subtype // "error") else empty end' "$gen_out" 2>/dev/null || true)"
 if [ -n "$gen_err" ]; then
-  ui_fail "генератор завершился ошибкой: $gen_err"
+  ui_outcome "agent-failed" "генератор завершился ошибкой: $gen_err"
   log_event "$run_dir" "$task_id" implement failed \
     "$(jq -cn --arg s "$gen_err" '{subtype: $s}')"
-  set_status "blocked"
+  set_status "agent-failed"
   printf 'генератор завершился ошибкой (%s) — задача blocked, каталог %s оставлен\n' \
     "$gen_err" "$work" >&2
+  exit 1
+fi
+
+# Канал «сделал, но с вопросом». Бот пишет вопрос в файл рабочего каталога, раннер читает файл —
+# не текст result: формат вывода у генераторов разный, а файл один на всех. Прогон 18.09 (kingfin,
+# задача без копирайта): бот выдумал текст и признался в итоговом сообщении, но дифф и гейт были
+# зелёные, и задача ушла в done с MR. Файл копируется в лог прогона: записи из веток стекаются в
+# одно место без конфликтов. Пустой файл — не вопрос.
+# Заметки бота по ходу (_scratch/*.md, каталог в .gitignore инстанса) уносятся в лог прогона
+# целиком и при любом исходе: записи из веток стекаются в одно место без конфликтов, владелец
+# разбирает их в /end-session вместе со своим буфером. В дифф каталог не попадает.
+scratch_dir="$work/repo/$(dirname "$NEEDS_OWNER_FILE")"
+if [ -d "$scratch_dir" ] && [ -n "$(find "$scratch_dir" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+  mkdir -p "$run_dir/scratch"
+  cp -R "$scratch_dir"/. "$run_dir/scratch/"
+  log_event "$run_dir" "$task_id" implement scratch \
+    "$(cd "$scratch_dir" && find . -mindepth 1 -maxdepth 1 | sed 's#^\./##' | jq -Rcs '{files: (split("\n") | map(select(length > 0)))}')"
+fi
+
+if [ -s "$work/repo/$NEEDS_OWNER_FILE" ]; then
+  question="$(head -c 2000 "$work/repo/$NEEDS_OWNER_FILE")"
+  ui_outcome "blocked" "бот ждёт владельца: $NEEDS_OWNER_FILE"
+  log_event "$run_dir" "$task_id" implement needs-owner \
+    "$(jq -cn --arg p "$NEEDS_OWNER_FILE" --arg q "$question" '{path: $p, question: $q}')"
+  set_status "blocked"
+  printf 'бот ждёт владельца — задача blocked, вопрос в %s/scratch/, каталог %s оставлен\n%s\n' \
+    "$run_dir" "$work" "$question" >&2
+  exit 1
+fi
+
+# Вторичный сигнал того же класса: бот вызвал AskUserQuestion, а в -p без хоста вызов отклоняется
+# молча и оседает в permission_denials итогового result (дока headless, 18.09.2026). Файл ловит
+# «знаю о пробеле и говорю словами», это поле — «попытался спросить и не смог». Поля нет → 0.
+all_denials="$(jq -r '(.permission_denials // []) | map(.tool_name // .tool // "?") | join(", ")' "$gen_out" 2>/dev/null || true)"
+[ -n "$all_denials" ] && log_event "$run_dir" "$task_id" implement denials-seen \
+  "$(jq -cn --arg d "$all_denials" '{tools: $d}')"
+denials="$(jq -r '(.permission_denials // []) | map(select((.tool_name // .tool // "") == "AskUserQuestion")) | map(.tool_name) | join(", ")' "$gen_out" 2>/dev/null || true)"
+if [ -n "$denials" ]; then
+  ui_outcome "blocked" "бот пытался спросить, вызов отклонён: $denials"
+  log_event "$run_dir" "$task_id" implement permission-denied \
+    "$(jq -c '{denials: (.permission_denials // [])}' "$gen_out" 2>/dev/null || printf '{}')"
+  set_status "blocked"
+  printf 'бот пытался спросить владельца (%s), в headless вызов отклонён — задача blocked, каталог %s оставлен\n' \
+    "$denials" "$work" >&2
   exit 1
 fi
 
@@ -257,9 +340,9 @@ changed="$(changed_paths)" || {
 }
 
 if [ -z "$changed" ]; then
-  ui_done "правка не потребовалась, MR не создан"
+  ui_outcome "no-change" "правка не потребовалась, MR не создан"
   log_event "$run_dir" "$task_id" implement no-change
-  set_status "done"
+  set_status "no-change"
   printf 'правка не потребовалась — MR не создан\n'
   exit 0
 fi
@@ -269,10 +352,10 @@ fi
 if [ -n "$READONLY_ZONES" ]; then
   viol="$(printf '%s\n' "$changed" | harness_readonly_violations "$READONLY_ZONES")"
   if [ -n "$viol" ]; then
-    ui_fail "дифф трогает readonly-зоны"
+    ui_outcome "scope-violation" "дифф трогает readonly-зоны"
     log_event "$run_dir" "$task_id" scope readonly-violation \
       "$(printf '%s' "$viol" | jq -Rcs '{paths: split("\n")}')"
-    set_status "blocked"
+    set_status "scope-violation"
     printf 'дифф трогает readonly-зоны — задача blocked:\n%s\n' "$viol" >&2
     exit 1
   fi
@@ -282,10 +365,10 @@ fi
 if [ -n "$WRITE_SCOPE" ]; then
   out_of_scope="$(printf '%s\n' "$changed" | harness_scope_violations "$WRITE_SCOPE")"
   if [ -n "$out_of_scope" ]; then
-    ui_fail "дифф вышел за область [$WRITE_SCOPE]"
+    ui_outcome "scope-violation" "дифф вышел за область [$WRITE_SCOPE]"
     log_event "$run_dir" "$task_id" scope out-of-scope \
       "$(printf '%s' "$out_of_scope" | jq -Rcs '{paths: split("\n"), allowed: "'"$WRITE_SCOPE"'"}')"
-    set_status "blocked"
+    set_status "scope-violation"
     printf 'дифф вышел за разрешённую область [%s]:\n%s\n' "$WRITE_SCOPE" "$out_of_scope" >&2
     exit 1
   fi
@@ -299,9 +382,9 @@ run_with_deadline "$DEADLINE_SEC" bash -c "cd '$gate_dir' && $GATE_CMD" > "$gate
 gate_rc=$?
 
 if [ "$gate_rc" -ne 0 ]; then
-  ui_fail "гейт красный (код $gate_rc)"
+  ui_outcome "gate-failed" "гейт красный (код $gate_rc)"
   log_event "$run_dir" "$task_id" gate red "$(jq -cn --arg rc "$gate_rc" '{exit_code: $rc}')"
-  set_status "blocked"
+  set_status "gate-failed"
   printf 'гейт красный (код %s) — MR не создаётся, разбор в %s\n' "$gate_rc" "$gate_out" >&2
   exit 1
 fi
@@ -318,10 +401,10 @@ if [ -n "$GATE_TEST_CMD" ]; then
     > "$test_out" 2>&1
   test_rc=$?
   if [ "$test_rc" -ne 0 ]; then
-    ui_fail "полный прогон тестов красный (код $test_rc)"
+    ui_outcome "gate-failed" "полный прогон тестов красный (код $test_rc)"
     log_event "$run_dir" "$task_id" gate-test red \
       "$(jq -cn --arg rc "$test_rc" '{exit_code: $rc}')"
-    set_status "blocked"
+    set_status "gate-failed"
     printf 'полный прогон тестов красный (код %s) — разбор в %s\n' \
       "$test_rc" "$test_out" >&2
     exit 1
@@ -339,7 +422,7 @@ if [ -n "$SECRET_SCAN_CMD" ]; then
     > "$scan_out" 2>&1
   scan_rc=$?
   if [ "$scan_rc" -ne 0 ]; then
-    ui_fail "секрет-скан красный (код $scan_rc)"
+    ui_outcome "blocked" "секрет-скан красный (код $scan_rc)"
     log_event "$run_dir" "$task_id" secret-scan red \
       "$(jq -cn --arg rc "$scan_rc" '{exit_code: $rc}')"
     set_status "blocked"
@@ -351,8 +434,24 @@ if [ -n "$SECRET_SCAN_CMD" ]; then
   log_event "$run_dir" "$task_id" secret-scan green
 fi
 
-g -C "$work/repo" add -A
-g -C "$work/repo" commit -qm "orc($task_id): автоматическая правка"
+# _scratch/ — канал, не правка: в коммит не идёт даже без .gitignore у таргета.
+# Длинная форма :(exclude): короткая «:!_scratch» падает — git читает «_» как magic-букву.
+g -C "$work/repo" add -A -- . ":(exclude)$scratch_rel"
+# Сообщение коммита — из конфига проекта: у kingfin хук commit-msg требует «MD-NNNN: …», а хуки
+# в клон не приезжают (§11 gotchas kingfin). {id} и {title} подставляются из задачи.
+task_title=""
+[ -n "$QUEUE_FILE" ] && [ -f "$QUEUE_FILE" ] && \
+  task_title="$(jq -r --arg id "$task_id" 'select(.id == $id) | .title // ""' "$QUEUE_FILE" 2>/dev/null | head -n 1)"
+commit_msg="${COMMIT_MSG_TEMPLATE//\{id\}/$task_id}"
+commit_msg="${commit_msg//\{title\}/$task_title}"
+# Неудачный коммит (нечего стейджить, пустое сообщение) раньше проглатывался, и push уходил с базой.
+g -C "$work/repo" commit -qm "$commit_msg" || {
+  ui_outcome "blocked" "коммит не создан"
+  log_event "$run_dir" "$task_id" push commit-failed
+  set_status "blocked"
+  printf 'коммит не создан — задача blocked, каталог %s оставлен\n' "$work" >&2
+  exit 1
+}
 
 # PUSH_OPTS разворачивается словами намеренно: -o ci.skip это два аргумента
 # shellcheck disable=SC2086
@@ -375,13 +474,13 @@ body="$work/mr-body.md"
 
 mr_path="$(mr_create "$MR_DIR" "$branch" "$BASE_BRANCH" "orc($task_id)" "$body")" || mr_path=""
 if [ -z "$mr_path" ]; then
-  ui_fail "MR не создан, а ветка уже запушена"
+  ui_outcome "blocked" "MR не создан, а ветка уже запушена"
   log_event "$run_dir" "$task_id" mr failed
   set_status "blocked"
   printf 'MR не создан, а ветка уже запушена — задача blocked, разбирать вручную\n' >&2
   exit 1
 fi
-ui_done "MR: $mr_path"
+ui_outcome "done" "MR: $mr_path"
 log_event "$run_dir" "$task_id" mr created "$(jq -cn --arg p "$mr_path" '{path: $p}')"
 set_status "done"
 printf 'MR: %s\n' "$mr_path"

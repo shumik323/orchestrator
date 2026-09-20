@@ -46,9 +46,10 @@ MR: /tmp/demo/mr/t-42.md
 
 Не проверено: push по токену в GitLab или GitHub (все прогоны шли в локальный bare-репозиторий), бэкенды `glab` и `gh`, `REPO_URL` по SSH, параллельные прогоны, поведение при заполненном диске.
 
-Не сделано: очередь из трекера задач, повторные попытки после красных проверок, работа больше чем над одним проектом за раз.
+Не сделано: очередь из трекера задач, повторные попытки после красных проверок, работа больше чем над одним проектом за раз. Параллельные прогоны одной очереди: файл очереди защищён mkdir-локом, но рабочие каталоги и лимит подписки раннеры не делят — дашборд второй запуск по той же очереди отклоняет, из CLI это на дисциплине.
 
-91 тест, полный прогон одной командой: `./scripts/verify-all.sh`.
+132 теста, полный прогон одной командой: `./scripts/verify-all.sh` — около 6 минут, большую часть
+времени занимают сценарии раннера с настоящими клонами и bare-репозиториями.
 
 ## Требования
 
@@ -81,6 +82,8 @@ QUEUE_FILE="queue/demo.jsonl"
 DEADLINE_SEC="900"
 MAX_BUDGET_USD="1.00"
 WRITE_SCOPE="src/features/x"
+# формат коммита бота — под хук проекта; {id} и {title} из задачи
+COMMIT_MSG_TEMPLATE="MD-0000: {title} [{id}]"
 EOF
 
 # 3. задача в очередь
@@ -92,9 +95,51 @@ echo '{"id":"t-42","title":"добавить проверку аргумента
 ./scripts/run-task.sh projects/demo.conf t-42
 ```
 
+Живой дашборд прогонов — `./scripts/dashboard.sh` (порт 8765): страница `dashboard/index.html` опрашивает
+очередь, `mr/` и JSONL-логи раз в 2 с — фазы с длительностями, цена и ходы, вопрос из `_scratch` у
+задач в `blocked`, заметки бота. Две кнопки — «запустить» для `ready` и «вернуть в ready» для
+`blocked`/`*-failed`: сервер `scripts/dashboard-server.py` (Python stdlib) зовёт `run-task.sh` в фоне
+и `queue_set_status`, переходы держит библиотека очереди. Слушает только `127.0.0.1` и требует
+заголовок `X-Orc` — чужая страница в браузере до действий не дотянется. `state` — симлинк на каталог логов.
+
+Сервер — Python 3 из macOS, Node не нужен. Запущенный из терминала он живёт, пока открыт терминал; из
+сессии Claude Code — пока жива сессия. Чтобы пережил и то и другое — отвязать от сессии:
+
+```bash
+nohup ./scripts/dashboard.sh 8765 > ~/.orchestrator/dashboard.log 2>&1 &
+```
+
+Автозапуск при логине — LaunchAgent (ключи по `man launchd.plist`):
+
+```bash
+cat > ~/Library/LaunchAgents/local.orchestrator.dashboard.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.orchestrator.dashboard</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>cd "$HOME/Desktop/orchestrator" && exec ./scripts/dashboard.sh 8765</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/orchestrator-dashboard.log</string>
+  <key>StandardErrorPath</key><string>/tmp/orchestrator-dashboard.log</string>
+</dict></plist>
+EOF
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.orchestrator.dashboard.plist
+# снять: launchctl bootout "gui/$(id -u)/local.orchestrator.dashboard"
+```
+
+`KeepAlive` перезапускает сервер после падения; путь к репозиторию в plist — свой. Проверка после
+логина: `curl -s -o /dev/null -w '%{http_code}' http://localhost:8765/dashboard/` → `200`.
+
+
 Прогресс печатается в stderr, путь к результату — в stdout. Вывод читается глазами и разбирается скриптом одновременно.
 
 Если целевой репозиторий содержит `.harness.conf`, команды проверок и запретные каталоги берутся оттуда, а не из конфига раннера.
+
+Генератор запускается с `--strict-mcp-config` и пустым списком MCP-серверов: серверы из `~/.claude.json` владельца в прогон не грузятся, боту они недоступны и не нужны. Хуки целевого репозитория тоже выключены (`disableAllHooks`) — гейт зовёт раннер.
 
 ## Устройство
 
@@ -120,6 +165,8 @@ echo '{"id":"t-42","title":"добавить проверку аргумента
 **Дедлайн реализован свой, потому что утилиты `timeout` на macOS нет.** Ожидание идёт по файлу с кодом возврата, а не по `kill -0` для pid: незажатый процесс отвечает на сигнал успехом. Убивается группа процессов, иначе дочерние процессы агента переживают дедлайн.
 
 **Ошибка агента не читается как «править было нечего».** Упор в лимит бюджета даёт пустой дифф, и первая версия помечала такую задачу выполненной.
+
+**Вопрос владельцу — файл, а не текст ответа.** Агент, которому не хватает входа, пишет вопрос в `_scratch/NEEDS-OWNER.md` рабочего каталога (имя — `NEEDS_OWNER_FILE` в конфиге). Раннер читает файл до гейта, ставит `blocked`, копирует его в лог прогона и MR не открывает. Текст ответа агента раннер не разбирает: формат вывода у генераторов разный, а файл один на всех. Замер 18.09: агент без копирайта придумал текст, признался в ответе — и задача ушла в `done` с MR. Вторичный сигнал того же класса — `permission_denials` в итоговом JSON: в `-p` без хоста вызов `AskUserQuestion` отклоняется молча, раннер читает это поле и тоже ставит `blocked`.
 
 **`set -e` не используется.** У раннера четыре штатных исхода, три из них неуспешные. Падение по `-e` превращало бы их в сбой без записи в лог.
 

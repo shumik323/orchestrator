@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orchestrator · прогоны</title>
+<style>
+  :root{color-scheme:light dark;
+    --plane:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#726f69;--grid:#e1e0d9;--ring:rgba(11,11,11,.10);
+    --good:#0ca30c;--warn:#fab219;--serious:#ec835a;--crit:#d03b3b;
+    --p1:#2069c4;--p2:#eb6834;--p3:#1baf7a;--p4:#eda100;--p5:#e87ba4}
+  @media (prefers-color-scheme:dark){:root{
+    --plane:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--ring:rgba(255,255,255,.10);
+    --p1:#3987e5;--p2:#d95926;--p3:#199e70;--p4:#c98500;--p5:#d55181}}
+  *{box-sizing:border-box}
+  body{margin:0;padding:20px 16px;background:var(--plane);color:var(--ink);font:14px/1.45 system-ui,-apple-system,sans-serif}
+  .top{position:sticky;top:0;background:var(--plane);padding:4px 0 8px;margin-bottom:8px;border-bottom:1px solid var(--grid);z-index:1}
+  h1{font-size:16px;font-weight:600;margin:0 0 4px}
+  @media (prefers-contrast:more){:root{--ring:rgba(11,11,11,.35);--grid:#b5b4ad;--muted:#5e5d58}}
+  @media (prefers-contrast:more) and (prefers-color-scheme:dark){:root{--ring:rgba(255,255,255,.4);--grid:#5a5a56;--muted:#b0afa8}}
+  .sub{color:var(--muted);font-size:12px}
+  .live{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--good);margin-right:6px;vertical-align:middle}
+  .live.stale{background:var(--serious)} .live.pending{background:var(--muted)}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:20px}
+  .tile{background:var(--surface);border:1px solid var(--ring);border-radius:8px;padding:10px 12px}
+  .tile b{display:block;font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
+  .tile span{color:var(--muted);font-size:12px}
+  .tile.ready{border-left:3px solid var(--muted)} .tile.running{border-left:3px solid var(--warn)} .tile.done{border-left:3px solid var(--good)} .tile.blocked{border-left:3px solid var(--serious)}
+  h2{font-size:13px;font-weight:600;color:var(--ink2);margin:20px 0 8px}
+  .scroll{overflow-x:auto}
+  table{width:100%;min-width:560px;border-collapse:collapse;background:var(--surface);border:1px solid var(--ring);border-radius:8px;overflow:hidden}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--grid);vertical-align:top}
+  th{color:var(--muted);font-weight:500;font-size:12px}
+  tr:last-child td{border-bottom:0}
+  td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .st{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .st i{width:8px;height:8px;border-radius:2px;display:inline-block;background:var(--muted)}
+  .st.done i{background:var(--good)} .st.blocked i{background:var(--serious)} .st.running i{background:var(--warn)} .st.failed i{background:var(--crit)}
+  .card{background:var(--surface);border:1px solid var(--ring);border-radius:8px;padding:12px 14px;margin-bottom:10px}
+  .card header{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;margin-bottom:8px}
+  .card header b{font-weight:600}
+  .card header .m{color:var(--ink2);font-variant-numeric:tabular-nums}
+  .bar{display:flex;gap:2px;height:14px;border-radius:4px;overflow:hidden;background:var(--grid)}
+  .bar div{min-width:4px;height:100%}
+  @keyframes pulse{50%{opacity:.55}} @keyframes card-in{from{opacity:0;transform:translateY(4px)}}
+  .bar div.open{animation:pulse 1.2s ease-in-out infinite}
+  .card.new{animation:card-in .3s ease-out}
+  @media (prefers-reduced-motion:reduce){.bar div.open{animation:none;outline:2px dashed var(--surface);outline-offset:-3px} .card.new{animation:none}}
+  .bar .ph1{background:var(--p1)} .bar .ph2{background:var(--p2)} .bar .ph3{background:var(--p3)} .bar .ph4{background:var(--p4)} .bar .ph5{background:var(--p5)}
+  .legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:6px;font-size:12px;color:var(--ink2)}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+  .q.notes{border-left-color:var(--muted)}
+  details.notes summary{cursor:pointer;color:var(--ink2);font-size:13px;margin-top:8px}
+  details.notes[open] summary{margin-bottom:0}
+  .q{margin-top:10px;padding:8px 10px;border-left:3px solid var(--serious);background:var(--plane);border-radius:0 6px 6px 0;white-space:pre-wrap;font-size:13px;max-height:180px;overflow:auto}
+  a{color:var(--p1)}
+  button{font:inherit;font-size:12px;padding:3px 9px;border:1px solid var(--ring);border-radius:6px;background:var(--surface);color:var(--ink);cursor:pointer}
+  button:hover{border-color:var(--muted)} button:disabled{opacity:.5;cursor:default}
+  button:focus-visible{outline:2px solid var(--p1);outline-offset:2px}
+  button:active{background:var(--ring)}
+  button[data-act="run"]{border-color:var(--p1);color:var(--p1)}
+  .msg{font-size:12px;color:var(--ink2);margin-left:8px} .msg.ok{color:var(--good)} .msg.err{color:var(--crit)}
+  .empty{color:var(--muted);padding:10px 0}
+</style>
+</head>
+<body>
+<div class="top"><h1>orchestrator · прогоны</h1>
+<div class="sub"><span class="live pending" id="live"></span><span id="upd">загрузка…</span> · опрос раз в 2 с · только чтение</div></div>
+<div class="tiles" id="tiles"><div class="tile"><b>…</b><span>загрузка</span></div></div>
+<h2>Очередь</h2>
+<div class="scroll" id="queue"><div class="empty">загрузка…</div></div>
+<h2>Прогоны, новые сверху</h2>
+<div id="runs"><div class="empty">загрузка…</div></div>
+<script>
+const PHASES = [['clone','клон',1],['setup','зависимости',2],['implement','генератор',3],['gate','гейт',4],['push','push',5]];
+const ST_LABEL = {ready:'ready', running:'running', done:'done', blocked:'blocked', 'no-change':'no-change',
+  'gate-failed':'gate-failed', 'scope-violation':'scope-violation', 'agent-failed':'agent-failed'};
+const stClass = s => ({done:'done', blocked:'blocked', running:'running'}[s] || (/fail|violation/.test(s) ? 'failed' : ''));
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt$ = v => v == null ? '—' : '$' + Number(v).toFixed(2);
+const fmtS = ms => ms == null ? '—' : (ms >= 1000 ? Math.round(ms/1000) + ' с' : ms + ' мс');
+
+async function text(url) {
+  const r = await fetch(url, {cache:'no-store'});
+  return r.ok ? r.text() : null;
+}
+const jsonl = t => (t || '').split('\n').filter(l => l.trim().startsWith('{')).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+const confByQueue = new Map();
+async function loadConfs() {
+  const html = await text('/projects/');
+  if (!html) return;
+  for (const m of html.matchAll(/href="([^"]+\.conf)"/g)) {
+    const name = decodeURIComponent(m[1]);
+    const body = await text('/projects/' + name);
+    const q = body && body.match(/^\s*QUEUE_FILE\s*=\s*"?[^"\n]*\/([^\/"\n]+)\.jsonl"?\s*$/m);
+    if (q) confByQueue.set(q[1], 'projects/' + name);
+  }
+}
+
+async function listQueues() {
+  const html = await text('/queue/');
+  if (!html) return [];
+  return [...html.matchAll(/href="([^"]+\.jsonl)"/g)].map(m => decodeURIComponent(m[1]));
+}
+
+// Один статус на id: строки очереди — журнал, последняя запись побеждает.
+async function loadTasks() {
+  const tasks = new Map();
+  for (const q of await listQueues()) {
+    for (const t of jsonl(await text('/queue/' + q))) if (t.id) tasks.set(t.id, {...t, queue: q.replace(/\.jsonl$/, '')});
+  }
+  return [...tasks.values()];
+}
+
+function summarize(events) {
+  const ph = {}, out = {phases: [], cost: null, turns: null, question: null, mr: null, outcome: null, start: null, end: null};
+  let prevEnd = null;
+  for (const e of events) {
+    const t = Date.parse(e.ts);
+    if (!out.start || t < out.start) out.start = t;
+    if (!out.end || t > out.end) out.end = t;
+    if (e.event === 'started') ph[e.phase] = {start: t};
+    if (e.event === 'finished' || e.event === 'green' || e.event === 'red') {
+      // push пишет одно событие finished без started: начало — конец предыдущей фазы
+      if (!ph[e.phase]) ph[e.phase] = {start: prevEnd ?? t};
+      ph[e.phase].end = t;
+    }
+    if (e.event === 'finished' || e.event === 'green') prevEnd = t;
+    if (e.payload && e.payload.cost_usd != null) { out.cost = e.payload.cost_usd; out.turns = e.payload.turns; }
+    if (e.event === 'needs-owner') { out.question = e.payload && e.payload.question; out.outcome = 'blocked'; }
+    if (e.event === 'permission-denied') out.outcome = 'blocked';
+    if (e.phase === 'mr' && e.event === 'created') out.outcome = 'done';
+    if (e.event === 'no-change') out.outcome = 'no-change';
+    if (e.event === 'timeout' || e.event === 'failed') out.outcome = 'agent-failed';
+    if (e.phase === 'gate' && e.event === 'red') out.outcome = 'gate-failed';
+    if (/violation|out-of-scope/.test(e.event)) out.outcome = 'scope-violation';
+  }
+  for (const [key, label, n] of PHASES) if (ph[key] && ph[key].start) out.phases.push({key, label, n, ms: (ph[key].end || Date.now()) - ph[key].start, open: !ph[key].end});
+  return out;
+}
+
+async function loadRuns(tasks) {
+  const runs = [];
+  await Promise.all(tasks.map(async t => {
+    const ev = jsonl(await text(`/state/logs/${encodeURIComponent(t.id)}/events.jsonl`));
+    if (!ev.length) return;
+    const s = summarize(ev);
+    if (s.question == null && s.outcome === 'blocked') s.question = await text(`/state/logs/${encodeURIComponent(t.id)}/scratch/NEEDS-OWNER.md`);
+    // заметки бота по ходу — при любом исходе; нет файла → 404 → null
+    s.notes = await text(`/state/logs/${encodeURIComponent(t.id)}/scratch/NOTES.md`);
+    runs.push({task: t, ...s});
+  }));
+  return runs.sort((a, b) => (b.start || 0) - (a.start || 0));
+}
+
+// Обновлять узел только когда его HTML изменился: полная замена innerHTML каждые 2 с
+// сбивает прокрутку и выделение текста, хотя на экране ничего не поменялось.
+function put(id, html) { const el = document.getElementById(id); if (el.innerHTML !== html) el.innerHTML = html; }
+
+const RETRY_FROM = new Set(['blocked', 'gate-failed', 'agent-failed', 'scope-violation']);
+// Состояние кнопок живёт здесь, не в DOM: таблица перерисовывается на каждом изменении,
+// и текст, записанный прямо в узел, пропал бы на следующем тике.
+const ui = {msg: {}, ok: {}, busy: new Set()};
+const seen = new Set(); let firstRender = true, lastGood = null;
+async function act(action, queue, id) {
+  const conf = confByQueue.get(queue);
+  if (!conf) { ui.msg[id] = 'нет conf для очереди ' + queue; ui.ok[id] = false; return tick(); }
+  ui.busy.add(id); ui.msg[id] = '…'; ui.ok[id] = null; await tick();
+  try {
+    const r = await fetch('/api/' + action, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Orc': '1'}, body: JSON.stringify({conf, id})});
+    const j = await r.json().catch(() => ({}));
+    ui.msg[id] = r.ok ? (action === 'run' ? 'запущено, pid ' + j.pid : 'вернул в ready') : (j.error || ('ошибка ' + r.status));
+    ui.ok[id] = r.ok;
+  } catch (e) { ui.msg[id] = 'нет связи с сервером'; ui.ok[id] = false; }
+  ui.busy.delete(id); tick();
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('button[data-act]');
+  if (b) act(b.dataset.act, b.dataset.queue, b.dataset.id);
+});
+
+function render(tasks, runs) {
+  const by = {};
+  for (const t of tasks) by[t.status] = (by[t.status] || 0) + 1;
+  const total = runs.reduce((a, r) => a + (r.cost || 0), 0);
+  put('tiles',
+    [['задач', tasks.length], ['ready', by.ready || 0], ['running', by.running || 0], ['done', by.done || 0], ['blocked', by.blocked || 0], ['потрачено', fmt$(total)]]
+    .map(([k, v]) => `<div class="tile ${/^(ready|running|done|blocked)$/.test(k) ? k : ''}"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join(''));
+
+  put('queue', tasks.length ? `<table><tr><th>id</th><th>статус</th><th>задача</th><th>очередь</th><th></th></tr>` +
+    tasks.map(t => `<tr><td><code>${esc(t.id)}</code></td><td><span class="st ${stClass(t.status)}"><i></i>${esc(ST_LABEL[t.status] || t.status)}</span></td><td>${esc(t.title)}</td><td>${esc(t.queue)}</td><td class="num">${t.status === 'ready' ? `<button data-act="run" data-queue="${esc(t.queue)}" data-id="${esc(t.id)}"${ui.busy.has(t.id) ? ' disabled' : ''}>запустить</button>` : RETRY_FROM.has(t.status) ? `<button data-act="ready" data-queue="${esc(t.queue)}" data-id="${esc(t.id)}"${ui.busy.has(t.id) ? ' disabled' : ''}>вернуть в ready</button>` : ''}<span class="msg ${ui.ok[t.id] === true ? 'ok' : ui.ok[t.id] === false ? 'err' : ''}">${esc(ui.msg[t.id] || '')}</span></td></tr>`).join('') + `</table>`
+    : `<div class="empty">очередь пуста</div>`);
+
+  put('runs', runs.length ? runs.map(r => {
+    const tot = r.phases.reduce((a, p) => a + p.ms, 0) || 1;
+    const bar = r.phases.map(p => `<div class="ph${p.n}${p.open ? ' open' : ''}" style="flex:${Math.max(p.ms, 0)} 0 0" title="${esc(p.label)}: ${fmtS(p.ms)}${p.open ? ' (идёт)' : ''}"></div>`).join('');
+    const barLabel = r.phases.map(p => `${p.label} ${fmtS(p.ms)}${p.open ? ', идёт' : ''}`).join(', ');
+    const isNew = !firstRender && !seen.has(r.task.id); seen.add(r.task.id);
+    const legend = r.phases.map(p => `<span><i class="ph${p.n}" style="background:var(--p${p.n})"></i>${esc(p.label)} ${fmtS(p.ms)}${p.open ? '…' : ''}</span>`).join('');
+    const st = r.task.status || r.outcome || '—';
+    return `<div class="card${isNew ? ' new' : ''}"><header><b>${esc(r.task.id)}</b><span class="st ${stClass(st)}"><i></i>${esc(st)}</span>
+      <span class="m">${fmt$(r.cost)} · ходов ${r.turns ?? '—'} · ${fmtS(tot)}</span>
+      ${r.outcome === 'done' ? `<a href="/mr/${encodeURIComponent(r.task.id)}.md">MR</a>` : ''}
+      <a href="/state/logs/${encodeURIComponent(r.task.id)}/events.jsonl">jsonl</a></header>
+      <div class="bar" role="img" aria-label="фазы: ${esc(barLabel)}">${bar}</div><div class="legend">${legend}</div>
+      ${r.question ? `<div class="q"><b>Нужен ответ:</b> ${esc(r.question.trim().slice(0, 1500))}</div>` : ''}
+      ${r.notes ? `<details class="notes"><summary>заметки бота (${r.notes.trim().split('\n').filter(Boolean).length})</summary><div class="q notes">${esc(r.notes.trim().slice(0, 1500))}</div></details>` : ''}</div>`;
+  }).join('') : `<div class="empty">прогонов ещё нет</div>`);
+  firstRender = false;
+}
+
+async function tick() {
+  try {
+    const tasks = await loadTasks();
+    render(tasks, await loadRuns(tasks));
+    lastGood = Date.now();
+    document.getElementById('live').classList.remove('stale', 'pending');
+    ago();
+  } catch (e) {
+    document.getElementById('live').classList.remove('pending');
+    document.getElementById('live').classList.add('stale');
+    document.getElementById('upd').textContent = 'нет связи с сервером' + (lastGood ? ', последние данные ' + Math.round((Date.now() - lastGood) / 1000) + ' с назад' : '');
+  }
+}
+// Подпись давности считается своим тиком раз в секунду: опрос идёт каждые 2 с, а данные меняются
+// реже — читателю важно «когда обновлялось», а не текущее время.
+function ago() {
+  if (lastGood == null || document.getElementById('live').classList.contains('stale')) return;
+  const n = Math.round((Date.now() - lastGood) / 1000);
+  document.getElementById('upd').textContent = n < 2 ? 'обновлено только что' : 'обновлено ' + n + ' с назад';
+}
+loadConfs().then(tick); setInterval(tick, 2000); setInterval(ago, 1000);
+</script>
+</body>
+</html>

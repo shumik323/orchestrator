@@ -155,8 +155,33 @@ async function loadRuns(tasks) {
 }
 
 // Обновлять узел только когда его HTML изменился: полная замена innerHTML каждые 2 с
-// сбивает прокрутку и выделение текста, хотя на экране ничего не поменялось.
-function put(id, html) { const el = document.getElementById(id); if (el.innerHTML !== html) el.innerHTML = html; }
+// сбивает прокрутку и выделение текста, хотя на экране ничего не поменялось. Сравнивать
+// с последней записанной строкой, не с el.innerHTML: браузер нормализует разметку при
+// сериализации (style="flex:93 0 0" → "0px", кавычки, сущности), и строки не совпадают никогда.
+const lastHtml = new WeakMap();
+function setHtml(el, html) { if (lastHtml.get(el) !== html) { el.innerHTML = html; lastHtml.set(el, html); } }
+function put(id, html) { setHtml(document.getElementById(id), html); }
+// Список карточек по ключу: у каждой карточки свои части, меняется только часть с новым HTML.
+// Карточка running обновляет полосу фаз каждый тик, а вопрос blocked-карточки рядом не трогается —
+// его можно прокручивать и выделять.
+function putCards(id, cards, emptyHtml) {
+  const c = document.getElementById(id);
+  if (!cards.length) { setHtml(c, emptyHtml); return; }
+  if (lastHtml.has(c)) { c.innerHTML = ''; lastHtml.delete(c); }
+  const have = new Map([...c.children].map(el => [el.dataset.key, el]));
+  cards.forEach((card, i) => {
+    let el = have.get(card.key);
+    if (!el) { el = document.createElement('div'); el.className = 'card' + (card.isNew ? ' new' : ''); el.dataset.key = card.key; }
+    have.delete(card.key);
+    for (const [part, html] of Object.entries(card.parts)) {
+      let node = el.querySelector(`:scope > [data-part="${part}"]`);
+      if (!node) { node = document.createElement('div'); node.dataset.part = part; el.appendChild(node); }
+      setHtml(node, html);
+    }
+    if (c.children[i] !== el) c.insertBefore(el, c.children[i] || null);
+  });
+  for (const el of have.values()) el.remove();
+}
 
 const RETRY_FROM = new Set(['blocked', 'gate-failed', 'agent-failed', 'scope-violation']);
 // Состояние кнопок живёт здесь, не в DOM: таблица перерисовывается на каждом изменении,
@@ -192,21 +217,23 @@ function render(tasks, runs) {
     tasks.map(t => `<tr><td><code>${esc(t.id)}</code></td><td><span class="st ${stClass(t.status)}"><i></i>${esc(ST_LABEL[t.status] || t.status)}</span></td><td>${esc(t.title)}</td><td>${esc(t.queue)}</td><td class="num">${t.status === 'ready' ? `<button data-act="run" data-queue="${esc(t.queue)}" data-id="${esc(t.id)}"${ui.busy.has(t.id) ? ' disabled' : ''}>запустить</button>` : RETRY_FROM.has(t.status) ? `<button data-act="ready" data-queue="${esc(t.queue)}" data-id="${esc(t.id)}"${ui.busy.has(t.id) ? ' disabled' : ''}>вернуть в ready</button>` : ''}<span class="msg ${ui.ok[t.id] === true ? 'ok' : ui.ok[t.id] === false ? 'err' : ''}">${esc(ui.msg[t.id] || '')}</span></td></tr>`).join('') + `</table>`
     : `<div class="empty">очередь пуста</div>`);
 
-  put('runs', runs.length ? runs.map(r => {
+  putCards('runs', runs.map(r => {
     const tot = r.phases.reduce((a, p) => a + p.ms, 0) || 1;
     const bar = r.phases.map(p => `<div class="ph${p.n}${p.open ? ' open' : ''}" style="flex:${Math.max(p.ms, 0)} 0 0" title="${esc(p.label)}: ${fmtS(p.ms)}${p.open ? ' (идёт)' : ''}"></div>`).join('');
     const barLabel = r.phases.map(p => `${p.label} ${fmtS(p.ms)}${p.open ? ', идёт' : ''}`).join(', ');
     const isNew = !firstRender && !seen.has(r.task.id); seen.add(r.task.id);
     const legend = r.phases.map(p => `<span><i class="ph${p.n}" style="background:var(--p${p.n})"></i>${esc(p.label)} ${fmtS(p.ms)}${p.open ? '…' : ''}</span>`).join('');
     const st = r.task.status || r.outcome || '—';
-    return `<div class="card${isNew ? ' new' : ''}"><header><b>${esc(r.task.id)}</b><span class="st ${stClass(st)}"><i></i>${esc(st)}</span>
+    return {key: r.task.id, isNew, parts: {
+      head: `<header><b>${esc(r.task.id)}</b><span class="st ${stClass(st)}"><i></i>${esc(st)}</span>
       <span class="m">${fmt$(r.cost)} · ходов ${r.turns ?? '—'} · ${fmtS(tot)}</span>
       ${r.outcome === 'done' ? `<a href="/mr/${encodeURIComponent(r.task.id)}.md">MR</a>` : ''}
-      <a href="/state/logs/${encodeURIComponent(r.task.id)}/events.jsonl">jsonl</a></header>
-      <div class="bar" role="img" aria-label="фазы: ${esc(barLabel)}">${bar}</div><div class="legend">${legend}</div>
-      ${r.question ? `<div class="q"><b>Нужен ответ:</b> ${esc(r.question.trim().slice(0, 1500))}</div>` : ''}
-      ${r.notes ? `<details class="notes"><summary>заметки бота (${r.notes.trim().split('\n').filter(Boolean).length})</summary><div class="q notes">${esc(r.notes.trim().slice(0, 1500))}</div></details>` : ''}</div>`;
-  }).join('') : `<div class="empty">прогонов ещё нет</div>`);
+      <a href="/state/logs/${encodeURIComponent(r.task.id)}/events.jsonl">jsonl</a></header>`,
+      bar: `<div class="bar" role="img" aria-label="фазы: ${esc(barLabel)}">${bar}</div><div class="legend">${legend}</div>`,
+      q: r.question ? `<div class="q"><b>Нужен ответ:</b> ${esc(r.question.trim().slice(0, 1500))}</div>` : '',
+      notes: r.notes ? `<details class="notes"><summary>заметки бота (${r.notes.trim().split('\n').filter(Boolean).length})</summary><div class="q notes">${esc(r.notes.trim().slice(0, 1500))}</div></details>` : ''
+    }};
+  }), `<div class="empty">прогонов ещё нет</div>`);
   firstRender = false;
 }
 

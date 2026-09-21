@@ -81,7 +81,7 @@
 // раньше в полосе не рисовались, и их время терялось (ревью 21.09). Цвет — по семейству.
 const PHASES = [['clone','клон',1],['setup','зависимости',2],['implement','генератор',3],['gate','гейт',4],['gate-test','тесты',4],['review','ревью',3],['secret-scan','секреты',4],['push','push',5],['mr','MR',5]];
 const PHASE_LABEL = Object.fromEntries(PHASES.map(([k, l]) => [k, l]));
-const END_EVENTS = new Set(['finished','green','red','created','failed','rejected','commit-failed','timeout','skipped']);
+const END_EVENTS = new Set(['finished','green','red','created','failed','rejected','commit-failed','timeout','skipped','tree-modified','gate-missing']);
 // Порядок плиток: draft до ready — это задачи без входов, их видно первыми. Нулевые плитки, кроме
 // четырёх основных, не рисуются: «задач 15» обязано сходиться с суммой плиток.
 const TILE_ORDER = ['draft','ready','running','done','blocked','gate-failed','agent-failed','scope-violation','no-change'];

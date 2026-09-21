@@ -296,6 +296,46 @@ GEN
   grep -q "Ревью: подтверждено 1, опровергнуто 1, P1 подтверждено 0" "$TMP/mr/t1.md"
 }
 
+@test "review_without_structured_output_is_failure_not_clean" {
+  sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="A B"|' "$CONF"
+  cat > "$TMP/rev.sh" <<'GEN'
+#!/bin/sh
+cat > /dev/null
+printf '%s\n' '{"type":"result","is_error":false,"total_cost_usd":0.2,"result":"Всё хорошо, находок нет."}'
+GEN
+  chmod +x "$TMP/rev.sh"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/rev.sh" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"review:failed"* ]]
+}
+
+@test "review_challenger_extra_p1_blocks_and_lowercase_track_counts" {
+  sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="a,b"|' "$CONF"
+  jq -c '.track = "a"' "$QUEUE" > "$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
+  fake_review "$TMP/rev.sh" '{"verdict":"ok","findings":[]}'
+  fake_review "$TMP/ch.sh" '{"findings":[{"id":"c9","verdict":"confirmed","evidence":"находка не в том поле","severity":"P1"}],"extra":[{"id":"c1","severity":"P1","ac":"CT-1","place":"file.txt:1","scenario":"критерий не выполнен"}]}'
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  grep -q "| c1 | P1 |" "$ORC_STATE/logs/t1/review/review.md"
+  grep -q "| c9 | P1 |" "$ORC_STATE/logs/t1/review/review.md"
+  [ "$(jq -r 'select(.phase=="review" and .event=="red") | .payload.p1' "$ORC_STATE/logs/t1/events.jsonl")" = "2" ]
+}
+
+@test "review_skipped_track_is_logged" {
+  jq -c '.track = "C"' "$QUEUE" > "$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
+  sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="A B"|' "$CONF"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"review:skipped"* ]]
+}
+
 @test "review_that_modifies_tree_is_refused" {
   sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="A B"|' "$CONF"
   fake_review "$TMP/rev.sh" '{"verdict":"ok","findings":[]}' "printf x > extra.txt"

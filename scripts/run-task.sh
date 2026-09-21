@@ -457,8 +457,13 @@ fi
 # таблицей вместо MR; P2/P3 — MR с таблицей. Ревью не правит дерево: изменённое дерево — отказ.
 task_track="$(jq -r --arg id "$task_id" 'select(.id == $id) | .track // empty' "${QUEUE_FILE:-/dev/null}" 2>/dev/null || true)"
 [ -n "$task_track" ] || task_track="$REVIEW_DEFAULT_TRACK"
+# Регистр и запятые не решают, будет ли ревью: "a" и "A,B" — одно и то же (ревью 21.09).
+task_track="$(printf '%s' "$task_track" | tr '[:lower:]' '[:upper:]')"
 review_wanted=0
-for tr in $REVIEW_TRACKS; do [ "$tr" = "$task_track" ] && review_wanted=1; done
+for tr in $(printf '%s' "$REVIEW_TRACKS" | tr ',' ' ' | tr '[:lower:]' '[:upper:]'); do [ "$tr" = "$task_track" ] && review_wanted=1; done
+if [ "$review_wanted" -eq 0 ]; then
+  log_event "$run_dir" "$task_id" review skipped "$(jq -cn --arg t "$task_track" '{track: $t}')"
+fi
 if [ "$review_wanted" -eq 1 ]; then
   review_dir="$run_dir/review"; mkdir -p "$review_dir"
   ui_phase "ревью (трек $task_track): ревьюер → опровергатель"
@@ -469,8 +474,10 @@ if [ "$review_wanted" -eq 1 ]; then
   review_tools="--tools Read,Grep,Glob,Bash --disallowedTools Edit,Write,MultiEdit,NotebookEdit \
 --settings '{\"disableAllHooks\": true}' --strict-mcp-config --mcp-config '$work/mcp-empty.json' \
 --max-budget-usd $REVIEW_BUDGET_USD --output-format json --permission-mode acceptEdits${REVIEW_MODEL:+ --model $REVIEW_MODEL}"
-  default_reviewer="claude -p $review_tools --allowedTools 'Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(cat *),Bash(ls*)' --json-schema '$(cat "$ORC_ROOT/prompts/review-reviewer.schema.json")'"
-  default_challenger="claude -p $review_tools --allowedTools 'Read,Grep,Glob,Bash' --json-schema '$(cat "$ORC_ROOT/prompts/review-challenger.schema.json")'"
+  # Схема читается внутри bash -c в двойных кавычках: вклеенная строкой в одинарных она рвалась бы
+  # на первом апострофе в description.
+  default_reviewer="claude -p $review_tools --allowedTools 'Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(cat *),Bash(ls*)' --json-schema \"\$(cat '$ORC_ROOT/prompts/review-reviewer.schema.json')\""
+  default_challenger="claude -p $review_tools --allowedTools 'Read,Grep,Glob,Bash' --json-schema \"\$(cat '$ORC_ROOT/prompts/review-challenger.schema.json')\""
   review_call() {  # <role> <cmd> <prompt-file> → JSON findings в stdout, лог в review/<role>.log
     local role="$1" cmd="$2" prompt="$3" out rc result
     out="$review_dir/$role.log"
@@ -480,10 +487,14 @@ if [ "$review_wanted" -eq 1 ]; then
     if [ "$rc" -ne 0 ] || [ -z "$result" ] || [ "$(printf '%s' "$result" | jq -r '.is_error // false')" = "true" ]; then
       return 1
     fi
-    printf '%s' "$result" | jq -c '.structured_output // .' > "$review_dir/$role.json" || return 1
+    # Только structured_output: ответ прозой мимо схемы — отказ ревью, а не «находок нет» (ревью 21.09).
+    local so
+    so="$(printf '%s' "$result" | jq -c '.structured_output // empty' 2>/dev/null)" || return 1
+    [ -n "$so" ] || return 1
+    printf '%s' "$so" > "$review_dir/$role.json"
     printf '%s' "$result" | jq -r '.total_cost_usd // empty'
   }
-  task_body="$(jq -r --arg id "$task_id" 'select(.id == $id) | .body // ""' "$QUEUE_FILE" 2>/dev/null | head -c 20000)"
+  task_body="$(jq -r --arg id "$task_id" 'select(.id == $id) | .body // ""' "${QUEUE_FILE:-/dev/null}" 2>/dev/null | head -c 20000)"
   # shellcheck disable=SC2016  # обратные кавычки markdown в printf, не подстановка
   { cat "$ORC_ROOT/prompts/review-reviewer.md"; printf '\n## Задача\n\n%s\n\n## Дифф\n\n```diff\n' "$task_body"; cat "$review_dir/diff.patch"; printf '```\n'; } > "$review_dir/reviewer.prompt"
   rev_cost="$(review_call reviewer "${ORC_REVIEW_CMD:-$default_reviewer}" "$review_dir/reviewer.prompt")" || {
@@ -514,11 +525,15 @@ if [ "$review_wanted" -eq 1 ]; then
     exit 1
   fi
   # Свод: находка без вердикта опровергателя считается подтверждённой (консервативно); extra — его.
+  # Вердикт по id, которого у ревьюера не было, — своя находка опровергателя не в том поле: в таблицу
+  # как подтверждённая, серьёзность из поля или P2, чтобы P1 не пропала молча (ревью 21.09).
   jq -s '
     (.[0].findings // []) as $r | (.[1].findings // []) as $c | (.[1].extra // []) as $x
     | ($c | map({key: .id, value: .}) | from_entries) as $v
+    | ($r | map(.id)) as $known
     | [ $r[] | . + {verdict: ($v[.id].verdict // "confirmed"), evidence: ($v[.id].evidence // "опровергатель не высказался")} ]
       + [ $x[] | . + {verdict: "confirmed", evidence: "находка опровергателя"} ]
+      + [ $c[] | select((.id as $i | $known | index($i)) == null) | {id: .id, severity: (.severity // "P2"), ac: (.ac // "—"), place: (.place // "—"), scenario: (.evidence // ""), verdict: "confirmed", evidence: "вердикт по неизвестному id — считается находкой опровергателя"} ]
   ' "$review_dir/reviewer.json" "$review_dir/challenger.json" > "$review_dir/merged.json"
   n_conf="$(jq '[.[] | select(.verdict == "confirmed")] | length' "$review_dir/merged.json")"
   n_ref="$(jq '[.[] | select(.verdict == "refuted")] | length' "$review_dir/merged.json")"

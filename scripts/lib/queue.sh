@@ -98,8 +98,11 @@ queue_set_status() {
     # Писатель держит лок миллисекунды; лок старше минуты — труп убитого раннера (Ctrl-C,
     # перезагрузка), иначе каждая запись ждала бы 10 с и падала навсегда (ревью 21.09).
     if [ "$waited" -eq 20 ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-      printf 'queue_set_status: снят залипший лок %s (старше минуты)\n' "$lock" >&2
-      rmdir "$lock" 2>/dev/null || true
+      # mv атомарен: из двух ждущих снять лок сможет один, второй не тронет лок нового писателя.
+      if mv "$lock" "$lock.stale.$$" 2>/dev/null; then
+        printf 'queue_set_status: снят залипший лок %s (старше минуты)\n' "$lock" >&2
+        rmdir "$lock.stale.$$" 2>/dev/null || true
+      fi
       continue
     fi
     if [ "$waited" -gt 100 ]; then

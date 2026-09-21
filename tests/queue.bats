@@ -18,6 +18,15 @@ setup() {
   [ "$output" = "$(cat "$ORC_ROOT/tests/fixtures/queue-5.ready")" ]
 }
 
+@test "stale_lock_older_than_a_minute_is_removed_instead_of_blocking_forever" {
+  mkdir "$Q.lock"
+  touch -t 202001010000 "$Q.lock"
+  run bash -c ". '$LIB'; queue_set_status '$Q' t4 running"
+  [ "$status" -eq 0 ]
+  [ ! -d "$Q.lock" ]
+  [ "$(jq -r 'select(.id=="t4").status' "$Q")" = "running" ]
+}
+
 @test "queue_set_status_changes_one_line_and_keeps_count" {
   bash -c ". '$LIB'; queue_set_status '$Q' t4 running"
   run bash -c ". '$LIB'; queue_set_status '$Q' t4 done"
@@ -86,6 +95,16 @@ setup() {
   run bash -c ". '$LIB'; queue_set_status '$Q' t4 done"
   [ "$status" -eq 3 ]
   [ "$(cat "$Q")" = "$before" ]
+}
+
+@test "fsm_draft_goes_only_to_ready" {
+  # draft — задача без входов (спека, контекст, токены); раннер её не берёт, дашборд не даёт кнопку «запустить».
+  printf '%s\n' '{"id":"t9","title":"черновик","body":"","status":"draft","blocked_by":[],"schema_version":1}' >> "$Q"
+  run bash -c ". '$LIB'; queue_set_status '$Q' t9 running"
+  [ "$status" -eq 3 ]
+  run bash -c ". '$LIB'; queue_set_status '$Q' t9 ready"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.id=="t9").status' "$Q")" = "ready" ]
 }
 
 @test "fsm_rejects_unknown_status" {

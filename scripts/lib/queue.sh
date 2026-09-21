@@ -34,10 +34,11 @@ queue_ready() {
 # Недопустимый переход — явная ошибка, а не тихая правка поля: состояние,
 # записанное в обход автомата, делает очередь недостоверной, и дальше система
 # врёт о себе молча.
-QUEUE_STATES="ready running done no-change gate-failed scope-violation agent-failed blocked"
+QUEUE_STATES="draft ready running done no-change gate-failed scope-violation agent-failed blocked"
 
 queue_transitions() {
   cat <<'EOF'
+draft:ready
 ready:running
 running:done no-change gate-failed scope-violation agent-failed blocked
 gate-failed:ready running
@@ -94,6 +95,13 @@ queue_set_status() {
   local lock="${qf}.lock" waited=0
   until mkdir "$lock" 2>/dev/null; do
     waited=$((waited + 1))
+    # Писатель держит лок миллисекунды; лок старше минуты — труп убитого раннера (Ctrl-C,
+    # перезагрузка), иначе каждая запись ждала бы 10 с и падала навсегда (ревью 21.09).
+    if [ "$waited" -eq 20 ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+      printf 'queue_set_status: снят залипший лок %s (старше минуты)\n' "$lock" >&2
+      rmdir "$lock" 2>/dev/null || true
+      continue
+    fi
     if [ "$waited" -gt 100 ]; then
       printf 'queue_set_status: очередь занята дольше 10 с (%s) — запись отменена\n' "$lock" >&2
       return 5

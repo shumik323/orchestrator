@@ -98,7 +98,7 @@ post() {  # $1 action, $2 id, $3 extra curl args
 
 # Ревью 20.09: статика из корня отдавала /.git, клоны с промптами и локальные конфиги.
 @test "server_hides_git_state_runs_and_scripts" {
-  for p in /.git/HEAD /state/runs/ /scripts/run-task.sh /README.md /projects/../README.md; do
+  for p in /.git/HEAD /state/runs/ /scripts/run-task.sh /README.md /projects/../README.md /dashboard/..%2f.git%2fHEAD /dashboard/..%2fREADME.md /queue/..%2fscripts%2frun-task.sh; do
     code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT$p")"
     [ "$code" = "404" ] || [ "$code" = "400" ] || { echo "$p → $code"; false; }
   done

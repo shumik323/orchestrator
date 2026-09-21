@@ -6,3 +6,4 @@ mr/
 queue/*.jsonl
 state
 __pycache__/
+queue/archive/

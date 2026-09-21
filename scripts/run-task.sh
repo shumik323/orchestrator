@@ -68,10 +68,25 @@ g() { git -c core.hooksPath="$work/nohooks" -c core.quotePath=false "$@"; }
 # приходится срезать, кириллица приезжает в эскейпах, а переименование печатается
 # одной строкой «старое -> новое» — три способа проскочить проверку зон.
 changed_paths() {
-  # _scratch/ — канал бота, а не правка: исключаем сами, не полагаясь на .gitignore таргета
-  { g -C "$work/repo" diff --name-only --no-renames HEAD || return 1
-    g -C "$work/repo" ls-files --others --exclude-standard || return 1
-  } | grep -v "^$(dirname "$NEEDS_OWNER_FILE")/" || true
+  # _scratch/ — канал бота, а не правка: исключаем сами, не полагаясь на .gitignore таргета.
+  # Список собирается отдельно от фильтра: `… | grep -v … || true` гасил статус всего конвейера,
+  # и битый клон читался как «правок нет» (ревью 21.09).
+  local listed
+  listed="$({ g -C "$work/repo" diff --name-only --no-renames HEAD || exit 1
+    g -C "$work/repo" ls-files --others --exclude-standard || exit 1; })" || return 1
+  printf '%s\n' "$listed" | grep -v "^$(dirname "$NEEDS_OWNER_FILE")/" || true
+}
+
+# Заметки бота (_scratch/*.md) уносятся в лог прогона при ЛЮБОМ исходе — и при таймауте, и при
+# ошибке генератора: следующий запуск сносит каталог, а бот мог 25 минут писать NOTES.md (faqs 20.09).
+copy_scratch() {
+  local scratch_dir
+  scratch_dir="$work/repo/$(dirname "$NEEDS_OWNER_FILE")"
+  [ -d "$scratch_dir" ] && [ -n "$(find "$scratch_dir" -mindepth 1 -print -quit 2>/dev/null)" ] || return 0
+  mkdir -p "$run_dir/scratch"
+  cp -R "$scratch_dir"/. "$run_dir/scratch/"
+  log_event "$run_dir" "$task_id" implement scratch \
+    "$(cd "$scratch_dir" && find . -mindepth 1 -maxdepth 1 | sed 's#^\./##' | jq -Rcs '{files: (split("\n") | map(select(length > 0)))}')"
 }
 
 # Инвариант обязан падать громко. Прогон не прерываем — его исход уже
@@ -268,8 +283,10 @@ gen_rc=$?
 
 if [ "$gen_rc" -eq 124 ]; then
   ui_outcome "agent-failed" "генератор не уложился в ${DEADLINE_SEC}с"
+  log_generator_result "$run_dir" "$task_id" "$gen_out"
   log_event "$run_dir" "$task_id" implement timeout \
     "$(jq -cn --arg d "$DEADLINE_SEC" '{deadline_sec: $d}')"
+  copy_scratch
   set_status "agent-failed"
   printf 'генератор не уложился в %s с — задача blocked, каталог %s оставлен\n' \
     "$DEADLINE_SEC" "$work" >&2
@@ -300,6 +317,7 @@ if [ -n "$gen_err" ]; then
   ui_outcome "agent-failed" "генератор завершился ошибкой: $gen_err"
   log_event "$run_dir" "$task_id" implement failed \
     "$(jq -cn --arg s "$gen_err" '{subtype: $s}')"
+  copy_scratch
   set_status "agent-failed"
   printf 'генератор завершился ошибкой (%s) — задача blocked, каталог %s оставлен\n' \
     "$gen_err" "$work" >&2
@@ -314,13 +332,7 @@ fi
 # Заметки бота по ходу (_scratch/*.md, каталог в .gitignore инстанса) уносятся в лог прогона
 # целиком и при любом исходе: записи из веток стекаются в одно место без конфликтов, владелец
 # разбирает их в /end-session вместе со своим буфером. В дифф каталог не попадает.
-scratch_dir="$work/repo/$(dirname "$NEEDS_OWNER_FILE")"
-if [ -d "$scratch_dir" ] && [ -n "$(find "$scratch_dir" -mindepth 1 -print -quit 2>/dev/null)" ]; then
-  mkdir -p "$run_dir/scratch"
-  cp -R "$scratch_dir"/. "$run_dir/scratch/"
-  log_event "$run_dir" "$task_id" implement scratch \
-    "$(cd "$scratch_dir" && find . -mindepth 1 -maxdepth 1 | sed 's#^\./##' | jq -Rcs '{files: (split("\n") | map(select(length > 0)))}')"
-fi
+copy_scratch
 
 if [ -s "$work/repo/$NEEDS_OWNER_FILE" ]; then
   question="$(head -c 2000 "$work/repo/$NEEDS_OWNER_FILE")"
@@ -336,14 +348,16 @@ fi
 # Вторичный сигнал того же класса: бот вызвал AskUserQuestion, а в -p без хоста вызов отклоняется
 # молча и оседает в permission_denials итогового result (дока headless, 18.09.2026). Файл ловит
 # «знаю о пробеле и говорю словами», это поле — «попытался спросить и не смог». Поля нет → 0.
-all_denials="$(jq -r '(.permission_denials // []) | map(.tool_name // .tool // "?") | join(", ")' "$gen_out" 2>/dev/null || true)"
+# Из строки result, не из файла: у stream-json в файле десятки JSON-документов, и jq печатал
+# столько же строк — многострочный payload ронял log_event, событие терялось (ревью 21.09).
+all_denials="$(printf '%s' "$gen_result" | jq -r '(.permission_denials // []) | map(.tool_name // .tool // "?") | join(", ")' 2>/dev/null || true)"
 [ -n "$all_denials" ] && log_event "$run_dir" "$task_id" implement denials-seen \
   "$(jq -cn --arg d "$all_denials" '{tools: $d}')"
-denials="$(jq -r '(.permission_denials // []) | map(select((.tool_name // .tool // "") == "AskUserQuestion")) | map(.tool_name) | join(", ")' "$gen_out" 2>/dev/null || true)"
+denials="$(printf '%s' "$gen_result" | jq -r '(.permission_denials // []) | map(select((.tool_name // .tool // "") == "AskUserQuestion")) | map(.tool_name) | join(", ")' 2>/dev/null || true)"
 if [ -n "$denials" ]; then
   ui_outcome "blocked" "бот пытался спросить, вызов отклонён: $denials"
   log_event "$run_dir" "$task_id" implement permission-denied \
-    "$(jq -c '{denials: (.permission_denials // [])}' "$gen_out" 2>/dev/null || printf '{}')"
+    "$(printf '%s' "$gen_result" | jq -c '{denials: (.permission_denials // [])}' 2>/dev/null || printf '{}')"
   set_status "blocked"
   printf 'бот пытался спросить владельца (%s), в headless вызов отклонён — задача blocked, каталог %s оставлен\n' \
     "$denials" "$work" >&2

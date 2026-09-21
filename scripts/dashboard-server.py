@@ -11,6 +11,7 @@ localhost, но кастомный заголовок требует preflight, 
 """
 import json, os, re, subprocess, sys, threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STATE = os.environ.get("ORC_STATE") or os.path.expanduser("~/.orchestrator")
@@ -18,8 +19,9 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$")
 CONF_RE = re.compile(r"^projects/[A-Za-z0-9_.-]+\.conf$")
 running = {}  # id → Popen; повторный запуск той же задачи, пока первая идёт, — отказ
 run_lock = threading.Lock()  # ThreadingHTTPServer: два клика подряд не должны дать два раннера
-# Наружу отдаются только эти пути: статика из корня целиком открывала /.git, /state/runs с промптами
-# и projects/*.local.conf (ревью 20.09). Всё остальное — 404.
+# Наружу отдаются только эти пути: статика из корня целиком открывала /.git и /state/runs с промптами
+# (ревью 20.09). projects/*.conf, включая *.local.conf, отдаются намеренно: дашборду нужен QUEUE_FILE
+# для кнопок, секретов в них нет — токены живут в окружении. Всё остальное — 404.
 GET_ALLOWED = re.compile(r"^/(dashboard/[^/]*|queue/|queue/[^/]+\.jsonl|mr/[^/]+\.md|projects/|projects/[^/]+\.conf|state/logs/[^/]+/(events\.jsonl|scratch/[^/]+\.md|stdout/[^/]+))$")
 # Ходы бота из stream-json генератора: вызовы тулов по мере записи файла, без чтения его целиком
 # клиентом (init-строка одна весит ~8 KB, лог прогона — сотни KB).
@@ -46,10 +48,15 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(403, {"error": "Host не localhost"})
         if self.path in ("/", "/dashboard"):
             self.send_response(302); self.send_header("Location", "/dashboard/"); self.end_headers(); return
-        m = STEPS_RE.match(self.path.split("?", 1)[0])
+        # Белый список сверяется с ДЕКОДИРОВАННЫМ путём: translate_path делает unquote после проверки,
+        # и /dashboard/..%2f.git%2fHEAD проходил регексп как dashboard/<файл> (ревью 21.09).
+        path = unquote(self.path.split("?", 1)[0])
+        if ".." in path.split("/"):
+            return self._json(404, {"error": "нет такого пути"})
+        m = STEPS_RE.match(path)
         if m:
             return self.steps(m.group(1))
-        if not GET_ALLOWED.match(self.path.split("?", 1)[0]):
+        if not GET_ALLOWED.match(path):
             return self._json(404, {"error": "нет такого пути"})
         return super().do_GET()
 

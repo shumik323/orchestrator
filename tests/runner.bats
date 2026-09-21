@@ -193,6 +193,41 @@ GEN
   [[ "$output" == *"gate-missing"* ]]
 }
 
+@test "scratch_notes_are_copied_on_generator_timeout" {
+  # faqs 20.09: бот 25 минут писал NOTES.md, упёрся в дедлайн — заметки жили только в runs/ до следующего запуска.
+  sed -i '' 's|DEADLINE_SEC="20"|DEADLINE_SEC="1"|' "$CONF"
+  run env ORC_GEN_CMD="sh -c 'mkdir -p _scratch; printf заметка > _scratch/NOTES.md; sleep 30'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "agent-failed" ]
+  [ -f "$ORC_STATE/logs/t1/scratch/NOTES.md" ]
+}
+
+@test "broken_clone_is_git_failed_not_no_change" {
+  run env ORC_GEN_CMD="sh -c 'rm -rf .git'" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map(.event) | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"git-failed"* ]]
+  [[ "$output" != *"no-change"* ]]
+}
+
+@test "permission_denials_in_stream_json_are_logged_not_lost" {
+  # stream-json: десятки документов в файле; jq по файлу давал многострочный payload и ронял log_event.
+  cat > "$TMP/gen.sh" <<'GEN'
+#!/bin/sh
+printf '{"type":"system","subtype":"init"}\n'
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"спрошу"}]}}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"permission_denials":[{"tool_name":"AskUserQuestion","tool_input":{"question":"какой копирайт?"}}],"total_cost_usd":0.1,"num_turns":1}\n'
+GEN
+  chmod +x "$TMP/gen.sh"
+  run env ORC_GEN_CMD="$TMP/gen.sh" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map(select(.event=="permission-denied")) | length' "$ORC_STATE/logs/t1/events.jsonl"
+  [ "$output" = "1" ]
+}
+
 # .harness.conf кладётся в целевой репозиторий: так же, как его туда положит
 # bootstrap.sh настоящего инстанса харнесса.
 seed_conf() {

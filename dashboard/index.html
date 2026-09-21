@@ -65,6 +65,7 @@
   button[data-act="run"]{border-color:var(--p1);color:var(--p1)}
   .msg{font-size:12px;color:var(--ink2);margin-left:8px} .msg.ok{color:var(--good)} .msg.err{color:var(--crit)}
   .empty{color:var(--muted);padding:10px 0}
+.why{margin-left:8px;font-weight:600}
 </style>
 </head>
 <body>
@@ -76,9 +77,16 @@
 <h2>Прогоны, новые сверху</h2>
 <div id="runs"><div class="empty">загрузка…</div></div>
 <script>
-const PHASES = [['clone','клон',1],['setup','зависимости',2],['implement','генератор',3],['gate','гейт',4],['push','push',5]];
-const ST_LABEL = {ready:'ready', running:'running', done:'done', blocked:'blocked', 'no-change':'no-change',
-  'gate-failed':'gate-failed', 'scope-violation':'scope-violation', 'agent-failed':'agent-failed'};
+// Все фазы раннера: gate-test (lint-all у kingfin — самая дорогая после генератора), секрет-скан и MR
+// раньше в полосе не рисовались, и их время терялось (ревью 21.09). Цвет — по семейству.
+const PHASES = [['clone','клон',1],['setup','зависимости',2],['implement','генератор',3],['gate','гейт',4],['gate-test','тесты',4],['secret-scan','секреты',4],['push','push',5],['mr','MR',5]];
+const PHASE_LABEL = Object.fromEntries(PHASES.map(([k, l]) => [k, l]));
+const END_EVENTS = new Set(['finished','green','red','created','failed','rejected','commit-failed','timeout','skipped']);
+// Порядок плиток: draft до ready — это задачи без входов, их видно первыми. Нулевые плитки, кроме
+// четырёх основных, не рисуются: «задач 15» обязано сходиться с суммой плиток.
+const TILE_ORDER = ['draft','ready','running','done','blocked','gate-failed','agent-failed','scope-violation','no-change'];
+const TERMINAL = new Set(['done','no-change','gate-failed','agent-failed','scope-violation','blocked','draft']);
+const WHY_SUBTYPE = s => s === 'error_max_budget_usd' ? 'бюджет исчерпан' : s === 'error_max_turns' ? 'лимит ходов' : /^exit-/.test(s || '') ? 'генератор вышел с кодом ' + s.slice(5) : (s || 'ошибка генератора');
 const stClass = s => ({done:'done', blocked:'blocked', running:'running'}[s] || (/fail|violation/.test(s) ? 'failed' : ''));
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt$ = v => v == null ? '—' : '$' + Number(v).toFixed(2);
@@ -118,43 +126,60 @@ async function loadTasks() {
 }
 
 function summarize(events) {
-  const ph = {}, out = {phases: [], cost: null, turns: null, question: null, mr: null, outcome: null, start: null, end: null};
+  const ph = {}, out = {phases: [], cost: null, turns: null, question: null, mr: null, outcome: null, why: null, start: null, end: null};
   let prevEnd = null;
+  const P = e => e.payload || {};
   for (const e of events) {
     const t = Date.parse(e.ts);
     if (!out.start || t < out.start) out.start = t;
     if (!out.end || t > out.end) out.end = t;
     if (e.event === 'started') ph[e.phase] = {start: t};
-    if (e.event === 'finished' || e.event === 'green' || e.event === 'red') {
-      // push пишет одно событие finished без started: начало — конец предыдущей фазы
+    if (END_EVENTS.has(e.event) && PHASE_LABEL[e.phase]) {
+      // push и mr пишут одно событие без started: начало — конец предыдущей фазы
       if (!ph[e.phase]) ph[e.phase] = {start: prevEnd ?? t};
       ph[e.phase].end = t;
+      prevEnd = t;
     }
-    if (e.event === 'finished' || e.event === 'green') prevEnd = t;
-    if (e.payload && e.payload.cost_usd != null) { out.cost = e.payload.cost_usd; out.turns = e.payload.turns; }
-    if (e.event === 'needs-owner') { out.question = e.payload && e.payload.question; out.outcome = 'blocked'; }
-    if (e.event === 'permission-denied') out.outcome = 'blocked';
+    if (P(e).cost_usd != null) { out.cost = P(e).cost_usd; out.turns = P(e).turns; }
+    // Исход и его причина — из событий: статус очереди говорит «agent-failed», а почему —
+    // только здесь (faqs 20.09: бюджет $2.50 виден был лишь в логе раннера).
+    if (e.event === 'needs-owner') { out.question = P(e).question; out.outcome = 'blocked'; out.why = 'бот ждёт владельца'; }
+    if (e.event === 'permission-denied') { out.outcome = 'blocked'; out.why = 'бот пытался спросить, в headless вызов отклонён'; }
+    if (e.event === 'gate-missing') { out.outcome = 'blocked'; out.why = 'гейт не задан ни в conf, ни в .harness.conf'; }
+    if (e.event === 'git-failed') { out.outcome = 'blocked'; out.why = 'git не перечислил изменения'; }
+    if (e.event === 'prompt-empty') { out.outcome = 'blocked'; out.why = 'пустой промпт'; }
     if (e.phase === 'mr' && e.event === 'created') out.outcome = 'done';
+    if (e.phase === 'mr' && e.event === 'failed') { out.outcome = 'blocked'; out.why = 'MR не создан'; }
+    if (e.phase === 'push' && (e.event === 'rejected' || e.event === 'commit-failed')) { out.outcome = 'blocked'; out.why = e.event === 'rejected' ? 'push отклонён гардрейлом' : 'коммит не удался'; }
     if (e.event === 'no-change') out.outcome = 'no-change';
-    if (e.event === 'timeout' || e.event === 'failed') out.outcome = 'agent-failed';
-    if (e.phase === 'gate' && e.event === 'red') out.outcome = 'gate-failed';
-    if (/violation|out-of-scope/.test(e.event)) out.outcome = 'scope-violation';
+    if (e.event === 'timeout') { out.outcome = 'agent-failed'; out.why = `дедлайн ${P(e).deadline_sec ?? '?'} с`; }
+    if (e.event === 'failed' && e.phase === 'implement') { out.outcome = 'agent-failed'; out.why = WHY_SUBTYPE(P(e).subtype); }
+    if (e.event === 'failed' && (e.phase === 'clone' || e.phase === 'setup')) { out.outcome = 'blocked'; out.why = `${PHASE_LABEL[e.phase]}: упало${P(e).exit_code != null ? ', exit ' + P(e).exit_code : ''}`; }
+    if (e.event === 'red' && (e.phase === 'gate' || e.phase === 'gate-test' || e.phase === 'secret-scan')) { out.outcome = 'gate-failed'; out.why = `${PHASE_LABEL[e.phase]}: красный${P(e).exit_code != null ? ', exit ' + P(e).exit_code : ''}`; }
+    if (/violation|out-of-scope/.test(e.event)) { out.outcome = 'scope-violation'; out.why = e.event === 'readonly-violation' ? 'правка в readonly-зоне' : 'правка вне WRITE_SCOPE'; }
   }
   for (const [key, label, n] of PHASES) if (ph[key] && ph[key].start) out.phases.push({key, label, n, ms: (ph[key].end || Date.now()) - ph[key].start, open: !ph[key].end});
   return out;
 }
 
+// Терминальная задача не меняется: её события, заметки и шаги читаются один раз, пока статус в
+// очереди тот же. Иначе 30 задач × 4 запроса каждые 2 с — сотня запросов ради неподвижных карточек.
+const runCache = new Map();
 async function loadRuns(tasks) {
   const runs = [];
   await Promise.all(tasks.map(async t => {
+    const c = runCache.get(t.id);
+    if (c && c.status === t.status) { if (c.run) runs.push({...c.run, task: t}); return; }
     const ev = jsonl(await text(`/state/logs/${encodeURIComponent(t.id)}/events.jsonl`));
-    if (!ev.length) return;
+    if (!ev.length) { if (TERMINAL.has(t.status)) runCache.set(t.id, {status: t.status, run: null}); return; }
     const s = summarize(ev);
     if (s.question == null && s.outcome === 'blocked') s.question = await text(`/state/logs/${encodeURIComponent(t.id)}/scratch/NEEDS-OWNER.md`);
     // заметки бота по ходу — при любом исходе; нет файла → 404 → null
     s.notes = await text(`/state/logs/${encodeURIComponent(t.id)}/scratch/NOTES.md`);
     try { s.steps = JSON.parse(await text(`/state/logs/${encodeURIComponent(t.id)}/steps.json`) || 'null'); } catch (e) { s.steps = null; }
-    runs.push({task: t, ...s});
+    const run = {task: t, ...s};
+    runs.push(run);
+    if (TERMINAL.has(t.status)) runCache.set(t.id, {status: t.status, run});
   }));
   return runs.sort((a, b) => (b.start || 0) - (a.start || 0));
 }
@@ -205,7 +230,7 @@ function md(text) {
 // Путь файла в клоне бота длинный и одинаковый у всех вызовов — показываем от корня репозитория.
 function shortTarget(t) { return (t || '').replace(/^.*\/repo\//, '').slice(0, 70); }
 
-const RETRY_FROM = new Set(['blocked', 'gate-failed', 'agent-failed', 'scope-violation']);
+const RETRY_FROM = new Set(['draft', 'blocked', 'gate-failed', 'agent-failed', 'scope-violation']);
 // Состояние кнопок живёт здесь, не в DOM: таблица перерисовывается на каждом изменении,
 // и текст, записанный прямо в узел, пропал бы на следующем тике.
 const ui = {msg: {}, ok: {}, busy: new Set()};
@@ -231,12 +256,15 @@ function render(tasks, runs) {
   const by = {};
   for (const t of tasks) by[t.status] = (by[t.status] || 0) + 1;
   const total = runs.reduce((a, r) => a + (r.cost || 0), 0);
-  put('tiles',
-    [['задач', tasks.length], ['ready', by.ready || 0], ['running', by.running || 0], ['done', by.done || 0], ['blocked', by.blocked || 0], ['потрачено', fmt$(total)]]
-    .map(([k, v]) => `<div class="tile ${/^(ready|running|done|blocked)$/.test(k) ? k : ''}"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join(''));
+  const known = new Set(TILE_ORDER);
+  const tiles = [['задач', tasks.length],
+    ...TILE_ORDER.filter(s => by[s] || /^(ready|running|done|blocked)$/.test(s)).map(s => [s, by[s] || 0]),
+    ...Object.keys(by).filter(s => !known.has(s)).map(s => [s, by[s]]),
+    ['потрачено', fmt$(total)]];
+  put('tiles', tiles.map(([k, v]) => `<div class="tile ${/^(ready|running|done|blocked)$/.test(k) ? k : stClass(k)}"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join(''));
 
   put('queue', tasks.length ? `<table><tr><th>id</th><th>статус</th><th>задача</th><th>очередь</th><th></th></tr>` +
-    tasks.map(t => `<tr><td><code>${esc(t.id)}</code></td><td><span class="st ${stClass(t.status)}"><i></i>${esc(ST_LABEL[t.status] || t.status)}</span></td><td>${esc(t.title)}</td><td>${esc(t.queue)}</td><td class="num">${t.status === 'ready' ? `<button data-act="run" data-queue="${esc(t.queue)}" data-id="${esc(t.id)}"${ui.busy.has(t.id) ? ' disabled' : ''}>запустить</button>` : RETRY_FROM.has(t.status) ? `<button data-act="ready" data-queue="${esc(t.queue)}" data-id="${esc(t.id)}"${ui.busy.has(t.id) ? ' disabled' : ''}>вернуть в ready</button>` : ''}<span class="msg ${ui.ok[t.id] === true ? 'ok' : ui.ok[t.id] === false ? 'err' : ''}">${esc(ui.msg[t.id] || '')}</span></td></tr>`).join('') + `</table>`
+    tasks.map(t => `<tr><td><code>${esc(t.id)}</code></td><td><span class="st ${stClass(t.status)}"><i></i>${esc(t.status)}</span></td><td>${esc(t.title)}</td><td>${esc(t.queue)}</td><td class="num">${t.status === 'ready' ? `<button data-act="run" data-queue="${esc(t.queue)}" data-id="${esc(t.id)}"${ui.busy.has(t.id) ? ' disabled' : ''}>запустить</button>` : RETRY_FROM.has(t.status) ? `<button data-act="ready" data-queue="${esc(t.queue)}" data-id="${esc(t.id)}"${ui.busy.has(t.id) ? ' disabled' : ''}>${t.status === 'draft' ? 'в ready' : 'вернуть в ready'}</button>` : ''}<span class="msg ${ui.ok[t.id] === true ? 'ok' : ui.ok[t.id] === false ? 'err' : ''}">${esc(ui.msg[t.id] || '')}</span></td></tr>`).join('') + `</table>`
     : `<div class="empty">очередь пуста</div>`);
 
   putCards('runs', runs.map(r => {
@@ -248,7 +276,7 @@ function render(tasks, runs) {
     const st = r.task.status || r.outcome || '—';
     return {key: r.task.id, isNew, parts: {
       head: `<header><b>${esc(r.task.id)}</b><span class="st ${stClass(st)}"><i></i>${esc(st)}</span>
-      <span class="m">${fmt$(r.cost)} · ходов ${r.turns ?? '—'} · ${fmtS(tot)}</span>
+      <span class="m">${fmt$(r.cost)} · ходов ${r.turns ?? '—'} · ${fmtS(tot)}</span>${r.why ? `<span class="why">${esc(r.why)}</span>` : ''}
       ${r.outcome === 'done' ? `<a href="/mr/${encodeURIComponent(r.task.id)}.md">MR</a>` : ''}
       <a href="/state/logs/${encodeURIComponent(r.task.id)}/events.jsonl">jsonl</a></header>`,
       bar: `<div class="bar" role="img" aria-label="фазы: ${esc(barLabel)}">${bar}</div><div class="legend">${legend}</div>`,
@@ -260,8 +288,14 @@ function render(tasks, runs) {
   firstRender = false;
 }
 
+// Тики не накладываются: если прошлый ещё ждёт ответов, этот пропускается. Конфиги проектов
+// перечитываются раз в 30 с — новый projects/*.conf раньше требовал перезагрузки страницы.
+let inFlight = false, confsAt = 0;
 async function tick() {
+  if (inFlight) return;
+  inFlight = true;
   try {
+    if (Date.now() - confsAt > 30000) { await loadConfs(); confsAt = Date.now(); }
     const tasks = await loadTasks();
     render(tasks, await loadRuns(tasks));
     lastGood = Date.now();
@@ -271,7 +305,7 @@ async function tick() {
     document.getElementById('live').classList.remove('pending');
     document.getElementById('live').classList.add('stale');
     document.getElementById('upd').textContent = 'нет связи с сервером' + (lastGood ? ', последние данные ' + Math.round((Date.now() - lastGood) / 1000) + ' с назад' : '');
-  }
+  } finally { inFlight = false; }
 }
 // Подпись давности считается своим тиком раз в секунду: опрос идёт каждые 2 с, а данные меняются
 // реже — читателю важно «когда обновлялось», а не текущее время.
@@ -280,7 +314,7 @@ function ago() {
   const n = Math.round((Date.now() - lastGood) / 1000);
   document.getElementById('upd').textContent = n < 2 ? 'обновлено только что' : 'обновлено ' + n + ' с назад';
 }
-loadConfs().then(tick); setInterval(tick, 2000); setInterval(ago, 1000);
+tick(); setInterval(tick, 2000); setInterval(ago, 1000);
 </script>
 </body>
 </html>

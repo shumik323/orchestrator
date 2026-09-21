@@ -79,7 +79,7 @@
 <script>
 // Все фазы раннера: gate-test (lint-all у kingfin — самая дорогая после генератора), секрет-скан и MR
 // раньше в полосе не рисовались, и их время терялось (ревью 21.09). Цвет — по семейству.
-const PHASES = [['clone','клон',1],['setup','зависимости',2],['implement','генератор',3],['gate','гейт',4],['gate-test','тесты',4],['secret-scan','секреты',4],['push','push',5],['mr','MR',5]];
+const PHASES = [['clone','клон',1],['setup','зависимости',2],['implement','генератор',3],['gate','гейт',4],['gate-test','тесты',4],['review','ревью',3],['secret-scan','секреты',4],['push','push',5],['mr','MR',5]];
 const PHASE_LABEL = Object.fromEntries(PHASES.map(([k, l]) => [k, l]));
 const END_EVENTS = new Set(['finished','green','red','created','failed','rejected','commit-failed','timeout','skipped']);
 // Порядок плиток: draft до ready — это задачи без входов, их видно первыми. Нулевые плитки, кроме
@@ -127,7 +127,7 @@ async function loadTasks() {
 }
 
 function summarize(events) {
-  const ph = {}, out = {phases: [], cost: null, turns: null, question: null, mr: null, outcome: null, why: null, start: null, end: null};
+  const ph = {}, out = {phases: [], cost: null, turns: null, question: null, mr: null, outcome: null, why: null, review: null, start: null, end: null};
   let prevEnd = null;
   const P = e => e.payload || {};
   for (const e of events) {
@@ -158,6 +158,10 @@ function summarize(events) {
     if (e.event === 'failed' && (e.phase === 'clone' || e.phase === 'setup')) { out.outcome = 'blocked'; out.why = `${PHASE_LABEL[e.phase]}: упало${P(e).exit_code != null ? ', exit ' + P(e).exit_code : ''}`; }
     if (e.event === 'red' && (e.phase === 'gate' || e.phase === 'gate-test' || e.phase === 'secret-scan')) { out.outcome = 'gate-failed'; out.why = `${PHASE_LABEL[e.phase]}: красный${P(e).exit_code != null ? ', exit ' + P(e).exit_code : ''}`; }
     if (/violation|out-of-scope/.test(e.event)) { out.outcome = 'scope-violation'; out.why = e.event === 'readonly-violation' ? 'правка в readonly-зоне' : 'правка вне WRITE_SCOPE'; }
+    if (e.phase === 'review' && e.event === 'red') { out.outcome = 'blocked'; out.why = `ревью: подтверждено P1 — ${P(e).p1 ?? '?'}`; out.review = P(e); }
+    if (e.phase === 'review' && e.event === 'green') out.review = P(e);
+    if (e.phase === 'review' && e.event === 'failed') { out.outcome = 'blocked'; out.why = `ревью не отработало (${P(e).role ?? '?'})`; }
+    if (e.phase === 'review' && e.event === 'tree-modified') { out.outcome = 'blocked'; out.why = 'ревью изменило рабочее дерево'; }
   }
   for (const [key, label, n] of PHASES) if (ph[key] && ph[key].start) out.phases.push({key, label, n, ms: (ph[key].end || Date.now()) - ph[key].start, open: !ph[key].end});
   return out;
@@ -279,6 +283,7 @@ function render(tasks, runs) {
       head: `<header><b>${esc(r.task.id)}</b><span class="st ${stClass(st)}"><i></i>${esc(st)}</span>
       <span class="m">${fmt$(r.cost)} · ходов ${r.turns ?? '—'} · ${fmtS(tot)}</span>${r.why ? `<span class="why">${esc(r.why)}</span>` : ''}
       ${r.outcome === 'done' ? `<a href="/mr/${encodeURIComponent(r.task.id)}.md">MR</a>` : ''}
+      ${r.review ? `<a href="/state/logs/${encodeURIComponent(r.task.id)}/review/review.md" title="подтверждено ${r.review.confirmed ?? '?'}, опровергнуто ${r.review.refuted ?? '?'}">ревью ${r.review.confirmed ?? '?'}/${r.review.refuted ?? '?'}</a>` : ''}
       <a href="/state/logs/${encodeURIComponent(r.task.id)}/events.jsonl">jsonl</a></header>`,
       bar: `<div class="bar" role="img" aria-label="фазы: ${esc(barLabel)}">${bar}</div><div class="legend">${legend}</div>`,
       steps: r.steps && r.steps.total ? `<div class="steps"><b>вызовов тулов: ${r.steps.total}</b>${r.steps.done ? '' : ' · идёт'}${r.steps.usage && r.steps.usage.turns ? ` · сообщений модели ${r.steps.usage.turns} · токены на вход ${fmtK(r.steps.usage.input + r.steps.usage.cache_write)} + кэш ${fmtK(r.steps.usage.cache_read)}` : ''} · ${r.steps.last.slice(-4).map(st => `<code>${esc(st.tool)}</code> ${esc(shortTarget(st.target))}`).join(' · ')}</div>${r.steps.repeat ? `<div class="steps why">⚠ ${r.steps.repeat.n} одинаковых вызовов подряд: <code>${esc(r.steps.repeat.tool)}</code> ${esc(shortTarget(r.steps.repeat.target))} — похоже на цикл</div>` : ''}` : '',

@@ -22,7 +22,7 @@ run_lock = threading.Lock()  # ThreadingHTTPServer: два клика подря
 # Наружу отдаются только эти пути: статика из корня целиком открывала /.git и /state/runs с промптами
 # (ревью 20.09). projects/*.conf, включая *.local.conf, отдаются намеренно: дашборду нужен QUEUE_FILE
 # для кнопок, секретов в них нет — токены живут в окружении. Всё остальное — 404.
-GET_ALLOWED = re.compile(r"^/(dashboard/[^/]*|queue/|queue/[^/]+\.jsonl|mr/[^/]+\.md|projects/|projects/[^/]+\.conf|state/logs/[^/]+/(events\.jsonl|scratch/[^/]+\.md|stdout/[^/]+))$")
+GET_ALLOWED = re.compile(r"^/(dashboard/[^/]*|queue/|queue/[^/]+\.jsonl|mr/[^/]+\.md|projects/|projects/[^/]+\.conf|state/logs/[^/]+/(events\.jsonl|scratch/[^/]+\.md|stdout/[^/]+|review/[^/]+\.(md|json|patch|log)))$")
 # Ходы бота из stream-json генератора: вызовы тулов по мере записи файла, без чтения его целиком
 # клиентом (init-строка одна весит ~8 KB, лог прогона — сотни KB).
 STEPS_RE = re.compile(r"^/state/logs/([A-Za-z0-9_.-]+)/steps\.json$")

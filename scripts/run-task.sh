@@ -43,6 +43,9 @@ esac
 : "${MR_DIR:=mr}"
 : "${DEADLINE_SEC:=1800}"
 : "${MAX_BUDGET_USD:=1.00}"
+: "${REVIEW_TRACKS:=A B}"          # треки с фазой review; C (мелкая правка) идёт в MR без ревью
+: "${REVIEW_DEFAULT_TRACK:=A}"     # задача без поля track — старший трек, ревью есть
+: "${REVIEW_BUDGET_USD:=1.00}"     # на каждый из двух вызовов ревью
 : "${ALLOWED_TOOLS:=Read,Edit,Bash}"
 : "${QUEUE_FILE:=}"
 : "${GATE_TEST_CMD:=}"
@@ -445,6 +448,98 @@ if [ -n "$GATE_TEST_CMD" ]; then
   log_event "$run_dir" "$task_id" gate-test green
 fi
 
+# Фаза review (решение владельца 21.09, вариант «ревьюер → опровергатель»): два чистых вызова
+# `claude -p` без истории генератора — иначе ревью наследует его рационализации (false consensus,
+# Qiu & Gill 2026). Маршрут по треку задачи (`track` в строке очереди, methodology-routing: A/B/C):
+# треки из REVIEW_TRACKS идут на ревью, остальные — сразу в MR. Подтверждённая P1 — blocked с
+# таблицей вместо MR; P2/P3 — MR с таблицей. Ревью не правит дерево: изменённое дерево — отказ.
+task_track="$(jq -r --arg id "$task_id" 'select(.id == $id) | .track // empty' "${QUEUE_FILE:-/dev/null}" 2>/dev/null || true)"
+[ -n "$task_track" ] || task_track="$REVIEW_DEFAULT_TRACK"
+review_wanted=0
+for tr in $REVIEW_TRACKS; do [ "$tr" = "$task_track" ] && review_wanted=1; done
+if [ "$review_wanted" -eq 1 ]; then
+  review_dir="$run_dir/review"; mkdir -p "$review_dir"
+  ui_phase "ревью (трек $task_track): ревьюер → опровергатель"
+  log_event "$run_dir" "$task_id" review started "$(jq -cn --arg t "$task_track" '{track: $t}')"
+  g -C "$work/repo" add -A -- . ":(exclude)$scratch_rel"
+  g -C "$work/repo" diff --cached > "$review_dir/diff.patch"
+  tree_before="$(g -C "$work/repo" diff --cached | shasum | cut -c1-40)|$(g -C "$work/repo" status --porcelain --untracked-files=all | grep -v "^?? $scratch_rel/" | shasum | cut -c1-40)"
+  review_tools="--tools Read,Grep,Glob,Bash --disallowedTools Edit,Write,MultiEdit,NotebookEdit \
+--settings '{\"disableAllHooks\": true}' --strict-mcp-config --mcp-config '$work/mcp-empty.json' \
+--max-budget-usd $REVIEW_BUDGET_USD --output-format json --permission-mode acceptEdits"
+  default_reviewer="claude -p $review_tools --allowedTools 'Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(cat *),Bash(ls*)' --json-schema '$(cat "$ORC_ROOT/prompts/review-reviewer.schema.json")'"
+  default_challenger="claude -p $review_tools --allowedTools 'Read,Grep,Glob,Bash' --json-schema '$(cat "$ORC_ROOT/prompts/review-challenger.schema.json")'"
+  review_call() {  # <role> <cmd> <prompt-file> → JSON findings в stdout, лог в review/<role>.log
+    local role="$1" cmd="$2" prompt="$3" out rc result
+    out="$review_dir/$role.log"
+    run_with_deadline "$DEADLINE_SEC" bash -c "cd '$work/repo' && $cmd < '$prompt'" > "$out" 2>&1
+    rc=$?
+    result="$(last_json_line "$out")"
+    if [ "$rc" -ne 0 ] || [ -z "$result" ] || [ "$(printf '%s' "$result" | jq -r '.is_error // false')" = "true" ]; then
+      return 1
+    fi
+    printf '%s' "$result" | jq -c '.structured_output // .' > "$review_dir/$role.json" || return 1
+    printf '%s' "$result" | jq -r '.total_cost_usd // empty'
+  }
+  task_body="$(jq -r --arg id "$task_id" 'select(.id == $id) | .body // ""' "$QUEUE_FILE" 2>/dev/null | head -c 20000)"
+  # shellcheck disable=SC2016  # обратные кавычки markdown в printf, не подстановка
+  { cat "$ORC_ROOT/prompts/review-reviewer.md"; printf '\n## Задача\n\n%s\n\n## Дифф\n\n```diff\n' "$task_body"; cat "$review_dir/diff.patch"; printf '```\n'; } > "$review_dir/reviewer.prompt"
+  rev_cost="$(review_call reviewer "${ORC_REVIEW_CMD:-$default_reviewer}" "$review_dir/reviewer.prompt")" || {
+    ui_outcome "blocked" "ревьюер не отработал, разбор в $review_dir/reviewer.log"
+    log_event "$run_dir" "$task_id" review failed '{"role":"reviewer"}'
+    set_status "blocked"
+    printf 'ревьюер не отработал — задача blocked, лог %s\n' "$review_dir/reviewer.log" >&2
+    exit 1
+  }
+  n_found="$(jq -r '.findings | length' "$review_dir/reviewer.json")"
+  log_event "$run_dir" "$task_id" review reviewer-finished "$(jq -cn --arg c "${rev_cost:-}" --argjson n "$n_found" '{findings: $n, cost_usd: ($c | if . == "" then null else tonumber end)}')"
+  ui_info "ревьюер: находок $n_found${rev_cost:+, $rev_cost USD}"
+  # shellcheck disable=SC2016  # обратные кавычки markdown в printf, не подстановка
+  { cat "$ORC_ROOT/prompts/review-challenger.md"; printf '\n## Задача\n\n%s\n\n## Находки первого ревьюера\n\n```json\n' "$task_body"; cat "$review_dir/reviewer.json"; printf '\n```\n\n## Дифф\n\n```diff\n'; cat "$review_dir/diff.patch"; printf '```\n'; } > "$review_dir/challenger.prompt"
+  ch_cost="$(review_call challenger "${ORC_CHALLENGE_CMD:-$default_challenger}" "$review_dir/challenger.prompt")" || {
+    ui_outcome "blocked" "опровергатель не отработал, разбор в $review_dir/challenger.log"
+    log_event "$run_dir" "$task_id" review failed '{"role":"challenger"}'
+    set_status "blocked"
+    printf 'опровергатель не отработал — задача blocked, лог %s\n' "$review_dir/challenger.log" >&2
+    exit 1
+  }
+  tree_after="$(g -C "$work/repo" diff --cached | shasum | cut -c1-40)|$(g -C "$work/repo" status --porcelain --untracked-files=all | grep -v "^?? $scratch_rel/" | shasum | cut -c1-40)"
+  if [ "$tree_before" != "$tree_after" ]; then
+    ui_outcome "blocked" "ревью изменило рабочее дерево — так нельзя"
+    log_event "$run_dir" "$task_id" review tree-modified
+    set_status "blocked"
+    printf 'ревью изменило рабочее дерево — задача blocked, каталог %s оставлен\n' "$work" >&2
+    exit 1
+  fi
+  # Свод: находка без вердикта опровергателя считается подтверждённой (консервативно); extra — его.
+  jq -s '
+    (.[0].findings // []) as $r | (.[1].findings // []) as $c | (.[1].extra // []) as $x
+    | ($c | map({key: .id, value: .}) | from_entries) as $v
+    | [ $r[] | . + {verdict: ($v[.id].verdict // "confirmed"), evidence: ($v[.id].evidence // "опровергатель не высказался")} ]
+      + [ $x[] | . + {verdict: "confirmed", evidence: "находка опровергателя"} ]
+  ' "$review_dir/reviewer.json" "$review_dir/challenger.json" > "$review_dir/merged.json"
+  n_conf="$(jq '[.[] | select(.verdict == "confirmed")] | length' "$review_dir/merged.json")"
+  n_ref="$(jq '[.[] | select(.verdict == "refuted")] | length' "$review_dir/merged.json")"
+  n_p1="$(jq '[.[] | select(.verdict == "confirmed" and .severity == "P1")] | length' "$review_dir/merged.json")"
+  {
+    printf '## Ревью: подтверждено %s, опровергнуто %s, P1 подтверждено %s\n\n' "$n_conf" "$n_ref" "$n_p1"
+    printf '| # | P | AC | место | сценарий отказа | опровергатель |\n|---|---|---|---|---|---|\n'
+    jq -r '.[] | "| \(.id) | \(.severity) | \(.ac // "—") | `\(.place)` | \(.scenario | gsub("\n"; " ") | gsub("\\|"; "/")) | \(.verdict): \(.evidence | gsub("\n"; " ") | gsub("\\|"; "/")) |"' "$review_dir/merged.json"
+  } > "$review_dir/review.md"
+  log_event "$run_dir" "$task_id" review challenger-finished "$(jq -cn --arg c "${ch_cost:-}" --argjson a "$n_conf" --argjson b "$n_ref" '{confirmed: $a, refuted: $b, cost_usd: ($c | if . == "" then null else tonumber end)}')"
+  if [ "$n_p1" -gt 0 ]; then
+    ui_outcome "blocked" "ревью: подтверждено P1 — $n_p1, таблица $review_dir/review.md"
+    log_event "$run_dir" "$task_id" review red "$(jq -cn --argjson p "$n_p1" --argjson c "$n_conf" '{p1: $p, confirmed: $c}')"
+    mkdir -p "$run_dir/scratch"
+    { printf 'NEEDS-OWNER: ревью подтвердило P1 (%s), MR не открыт\n\n' "$n_p1"; cat "$review_dir/review.md"; } > "$run_dir/scratch/NEEDS-OWNER.md"
+    set_status "blocked"
+    printf 'ревью подтвердило P1 — задача blocked, таблица %s\n' "$review_dir/review.md" >&2
+    exit 1
+  fi
+  ui_ok "ревью: подтверждено $n_conf, опровергнуто $n_ref, P1 нет"
+  log_event "$run_dir" "$task_id" review green "$(jq -cn --argjson c "$n_conf" --argjson r "$n_ref" '{confirmed: $c, refuted: $r}')"
+fi
+
 # Шаг 3. Секрет, уехавший в MR, дороже красного гейта. Скан задаёт инстанс.
 if [ -n "$SECRET_SCAN_CMD" ]; then
   scan_out="$(log_phase_stdout "$run_dir" secret-scan)"
@@ -502,6 +597,8 @@ body="$work/mr-body.md"
   printf 'Изменения:\n\n'
   g -C "$work/repo" diff --stat "origin/$BASE_BRANCH"..HEAD
   printf '\nЛог прогона: %s\n' "$run_dir/events.jsonl"
+  # Таблица ревью — в MR: владелец чинит подтверждённое при мерже, а не ищет её в логах.
+  [ -f "$run_dir/review/review.md" ] && { printf '\n'; cat "$run_dir/review/review.md"; }
 } > "$body"
 
 mr_path="$(mr_create "$MR_DIR" "$branch" "$BASE_BRANCH" "orc($task_id)" "$body")" || mr_path=""

@@ -1,0 +1,4 @@
+{"type":"object","required":["verdict","findings"],"additionalProperties":false,"properties":{
+ "verdict":{"type":"string","enum":["ok","findings"]},
+ "findings":{"type":"array","items":{"type":"object","required":["id","severity","place","scenario"],"properties":{
+   "id":{"type":"string"},"severity":{"type":"string","enum":["P1","P2","P3"]},"ac":{"type":"string"},"place":{"type":"string"},"scenario":{"type":"string"}}}}}}

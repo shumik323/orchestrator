@@ -228,6 +228,77 @@ GEN
   [ "$output" = "1" ]
 }
 
+# Фейки ревью: читают промпт со stdin, печатают JSON как `claude -p --output-format json --json-schema`.
+fake_review() {  # <файл> <structured_output-json> [команда до ответа]
+  cat > "$1" <<GEN
+#!/bin/sh
+cat > /dev/null
+${3:-:}
+printf '%s\n' '{"type":"result","is_error":false,"total_cost_usd":0.2,"structured_output":$2}'
+GEN
+  chmod +x "$1"
+}
+
+@test "review_runs_by_default_and_attaches_table_to_mr" {
+  fake_review "$TMP/rev.sh" '{"verdict":"ok","findings":[]}' "touch $TMP/reviewed"
+  fake_review "$TMP/ch.sh" '{"findings":[],"extra":[]}' "touch $TMP/challenged"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ -f "$TMP/reviewed" ] && [ -f "$TMP/challenged" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+  grep -q "Ревью: подтверждено 0" "$TMP/mr/t1.md"
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"review:green"* ]]
+}
+
+@test "review_is_skipped_for_track_c" {
+  jq -c '.track = "C"' "$QUEUE" > "$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
+  fake_review "$TMP/rev.sh" '{"verdict":"ok","findings":[]}' "touch $TMP/reviewed"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/rev.sh" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ ! -f "$TMP/reviewed" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+}
+
+@test "review_confirmed_p1_blocks_before_push" {
+  fake_review "$TMP/rev.sh" '{"verdict":"findings","findings":[{"id":"r1","severity":"P1","ac":"CT-1","place":"file.txt:1","scenario":"строка не та"}]}'
+  fake_review "$TMP/ch.sh" '{"findings":[{"id":"r1","verdict":"confirmed","evidence":"grep подтвердил"}],"extra":[]}'
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ -z "$(refs_in_target)" ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  grep -q "NEEDS-OWNER: ревью подтвердило P1" "$ORC_STATE/logs/t1/scratch/NEEDS-OWNER.md"
+  grep -q "grep подтвердил" "$ORC_STATE/logs/t1/review/review.md"
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"review:red"* ]]
+}
+
+@test "review_refuted_p1_goes_to_mr_with_table" {
+  fake_review "$TMP/rev.sh" '{"verdict":"findings","findings":[{"id":"r1","severity":"P1","ac":"CT-1","place":"file.txt:1","scenario":"строка не та"}]}'
+  fake_review "$TMP/ch.sh" '{"findings":[{"id":"r1","verdict":"refuted","evidence":"строка на месте, cat показал"}],"extra":[{"id":"c1","severity":"P3","place":"file.txt:1","scenario":"нет перевода строки"}]}'
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "done" ]
+  grep -q "refuted: строка на месте" "$TMP/mr/t1.md"
+  grep -q "Ревью: подтверждено 1, опровергнуто 1, P1 подтверждено 0" "$TMP/mr/t1.md"
+}
+
+@test "review_that_modifies_tree_is_refused" {
+  fake_review "$TMP/rev.sh" '{"verdict":"ok","findings":[]}' "printf x > extra.txt"
+  fake_review "$TMP/ch.sh" '{"findings":[],"extra":[]}'
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map(.event) | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"tree-modified"* ]]
+}
+
 # .harness.conf кладётся в целевой репозиторий: так же, как его туда положит
 # bootstrap.sh настоящего инстанса харнесса.
 seed_conf() {

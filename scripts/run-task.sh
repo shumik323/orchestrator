@@ -58,6 +58,8 @@ esac
 : "${SETUP_CMD:=}"
 : "${SETUP_MARKER:=node_modules}"
 : "${NEEDS_OWNER_FILE:=_scratch/NEEDS-OWNER.md}"
+: "${MCP_CONFIG:=}"
+: "${MCP_TOOLS:=}"
 : "${COMMIT_MSG_TEMPLATE:=orc({id}): автоматическая правка}"
 
 orc_init_state
@@ -270,11 +272,33 @@ task_scope="$(jq -r --arg id "$task_id" 'select(.id == $id) | .scope // empty' \
 # --strict-mcp-config с пустым конфигом: MCP-серверы из ~/.claude.json пользователя (у владельца
 # четыре) грузили бы схемы тулов в контекст каждого прогона; боту они недоступны и не нужны.
 printf '{"mcpServers":{}}' > "$work/mcp-empty.json"
+# MCP боту доступен только по явному ключу MCP_CONFIG в конфиге проекта, и только теми инструментами,
+# что перечислены в MCP_TOOLS. Мотив ограничения: схемы тулов едут в контекст каждого прогона, а
+# мутирующие тулы внешних сервисов из автономного прогона недопустимы. Локальный сервер Figma
+# (127.0.0.1:3845) читает АКТИВНЫЙ файл десктопного приложения и ключ файла игнорирует — прогон с ним
+# зависит от того, что открыто на экране; это записано в конфиге проекта, который его включает.
+mcp_config="$work/mcp-empty.json"
+mcp_tools=""
+if [ -n "${MCP_CONFIG:-}" ]; then
+  if [ ! -f "$MCP_CONFIG" ]; then
+    ui_fail "MCP_CONFIG указывает на несуществующий файл: $MCP_CONFIG"
+    log_event "$run_dir" "$task_id" clone mcp-config-missing "$(jq -cn --arg p "$MCP_CONFIG" '{path: $p}')"
+    queue_set_status "$QUEUE_FILE" "$task_id" blocked
+    exit 1
+  fi
+  mcp_config="$MCP_CONFIG"
+  mcp_tools="${MCP_TOOLS:-}"
+  ui_info "MCP: $(basename "$MCP_CONFIG"), инструменты [${mcp_tools:-нет}]"
+  log_event "$run_dir" "$task_id" clone mcp-enabled \
+    "$(jq -cn --arg c "$MCP_CONFIG" --arg t "$mcp_tools" '{config: $c, tools: $t}')"
+fi
+gen_tools="$ALLOWED_TOOLS"
+[ -n "$mcp_tools" ] && gen_tools="$ALLOWED_TOOLS,$mcp_tools"
 # stream-json: строка на событие, результат последней строкой — дашборд читает ходы по мере записи
 # (замер 20.09: файл растёт построчно, без --verbose поток в -p не работает). Поля result те же.
 default_gen="claude -p --output-format stream-json --verbose --max-budget-usd $MAX_BUDGET_USD \
---allowedTools $ALLOWED_TOOLS --permission-mode acceptEdits \
---settings '{\"disableAllHooks\": true}' --strict-mcp-config --mcp-config '$work/mcp-empty.json'"
+--allowedTools $gen_tools --permission-mode acceptEdits \
+--settings '{\"disableAllHooks\": true}' --strict-mcp-config --mcp-config '$mcp_config'"
 gen_cmd="${ORC_GEN_CMD:-$default_gen}"
 gen_out="$(log_phase_stdout "$run_dir" implement)"
 

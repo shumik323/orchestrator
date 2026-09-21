@@ -729,3 +729,22 @@ EOC
   run git -C "$TMP/target.git" log -1 --format=%s refs/heads/orc/t1
   [ "$output" = "MD-0000: проба [t1]" ]
 }
+
+@test "mcp_is_off_unless_project_conf_asks_for_it" {
+  # без MCP_CONFIG раннер обязан звать генератор с пустым конфигом: схемы чужих тулов не должны
+  # доезжать до бота, а мутирующие тулы внешних сервисов — тем более
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$@" > "$TMP_ARGS"' 'printf "x\n" >> file.txt' \
+    'printf "{\"result\":\"ok\",\"is_error\":false}\n"' > "$TMP/gen.sh"
+  chmod +x "$TMP/gen.sh"
+  run env TMP_ARGS="$TMP/args.txt" ORC_GEN_CMD="$TMP/gen.sh" "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -eq 0 ]
+  ! grep -q 'mcp-figma' "$TMP/args.txt" 2>/dev/null
+}
+
+@test "missing_mcp_config_blocks_task_instead_of_running_without_it" {
+  printf 'MCP_CONFIG="%s/no-such-mcp.json"\n' "$TMP" >> "$CONF"
+  run "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"MCP_CONFIG"* ]]
+  [ "$(jq -r 'select(.id=="t1") | .status' "$QUEUE")" = "blocked" ]
+}

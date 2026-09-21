@@ -159,6 +159,40 @@ GEN
   [[ "$output" == *"implement:failed"* ]]
 }
 
+@test "generator_nonzero_exit_without_json_is_agent_failed_not_no_change" {
+  # Ревью 21.09: rate-limit подписки печатает «API Error: 429» в stderr и выходит с 1 —
+  # диффа нет, и раннер считал это «править было нечего».
+  run env ORC_GEN_CMD="sh -c 'echo \"API Error: 429\" >&2; exit 1'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "agent-failed" ]
+  run jq -rs 'map("\(.phase):\(.event)") | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"implement:failed"* ]]
+}
+
+@test "generator_crash_with_half_diff_is_agent_failed_not_done" {
+  run env ORC_GEN_CMD="sh -c 'printf half >> file.txt; exit 1'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ -z "$(refs_in_target)" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "agent-failed" ]
+}
+
+@test "missing_gate_cmd_everywhere_blocks_instead_of_green" {
+  # Ни в conf проекта, ни в .harness.conf клона: раньше GATE_CMD молча становился true.
+  grep -v '^GATE_CMD=' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+  run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" \
+    "$ORC_ROOT/scripts/run-task.sh" "$CONF" t1
+  [ "$status" -ne 0 ]
+  [ ! -f "$TMP/mr/t1.md" ]
+  [ -z "$(refs_in_target)" ]
+  [ "$(jq -r 'select(.id=="t1").status' "$QUEUE")" = "blocked" ]
+  run jq -rs 'map(.event) | join(" ")' "$ORC_STATE/logs/t1/events.jsonl"
+  [[ "$output" == *"gate-missing"* ]]
+}
+
 # .harness.conf кладётся в целевой репозиторий: так же, как его туда положит
 # bootstrap.sh настоящего инстанса харнесса.
 seed_conf() {

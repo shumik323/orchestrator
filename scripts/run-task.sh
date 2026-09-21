@@ -38,7 +38,7 @@ esac
 
 : "${BASE_BRANCH:=main}"
 : "${BRANCH_PREFIX:=orc}"
-: "${GATE_CMD:=true}"
+: "${GATE_CMD:=}"
 : "${PUSH_OPTS:=}"
 : "${MR_DIR:=mr}"
 : "${DEADLINE_SEC:=1800}"
@@ -146,6 +146,16 @@ if [ -f "$inst_conf" ]; then
   log_event "$run_dir" "$task_id" clone harness-conf \
     "$(jq -cn --arg g "$GATE_CMD" --arg z "$READONLY_ZONES" \
        '{gate_cmd: $g, readonly_zones: $z}')"
+fi
+
+# Гейт обязателен. Раньше пустой GATE_CMD молча становился `true`: ветка без единой проверки
+# уходила в MR, а «гейт зелёный» читалось как результат (ревью 21.09: репо без .harness.conf).
+if [ -z "$GATE_CMD" ]; then
+  ui_outcome "blocked" "гейт не задан: нет GATE_CMD ни в conf проекта, ни в .harness.conf клона"
+  log_event "$run_dir" "$task_id" clone gate-missing '{}'
+  set_status "blocked"
+  printf 'гейт не задан — задача blocked, каталог %s оставлен\n' "$work" >&2
+  exit 1
 fi
 
 ui_ok "клон"
@@ -281,6 +291,11 @@ log_event "$run_dir" "$task_id" implement finished \
 gen_err="$(printf '%s' "$gen_result" | jq -r '
   if (.is_error == true) or (((.subtype // "") | startswith("error")))
   then (.subtype // "error") else empty end' 2>/dev/null || true)"
+# Код выхода без JSON-строки результата — rate-limit, «Not logged in», крэш CLI. Пустой дифф при
+# этом читался как no-change, полдиффа — как done (ревью 21.09, замер на симуляции).
+if [ -z "$gen_err" ] && [ "$gen_rc" -ne 0 ]; then
+  gen_err="exit-$gen_rc"
+fi
 if [ -n "$gen_err" ]; then
   ui_outcome "agent-failed" "генератор завершился ошибкой: $gen_err"
   log_event "$run_dir" "$task_id" implement failed \

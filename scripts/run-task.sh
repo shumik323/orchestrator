@@ -45,7 +45,8 @@ esac
 : "${MAX_BUDGET_USD:=1.00}"
 : "${REVIEW_TRACKS:=A B}"          # треки с фазой review; C (мелкая правка) идёт в MR без ревью
 : "${REVIEW_DEFAULT_TRACK:=A}"     # задача без поля track — старший трек, ревью есть
-: "${REVIEW_BUDGET_USD:=1.00}"     # на каждый из двух вызовов ревью
+: "${REVIEW_BUDGET_USD:=2.50}"     # на каждый из двух вызовов ревью: вход в контекст kingfin — ~$0.6 (проба 21.09)
+: "${REVIEW_MODEL:=}"              # пусто — модель CLI по умолчанию; sonnet режет цену ревью в разы
 : "${ALLOWED_TOOLS:=Read,Edit,Bash}"
 : "${QUEUE_FILE:=}"
 : "${GATE_TEST_CMD:=}"
@@ -466,7 +467,7 @@ if [ "$review_wanted" -eq 1 ]; then
   tree_before="$(g -C "$work/repo" diff --cached | shasum | cut -c1-40)|$(g -C "$work/repo" status --porcelain --untracked-files=all | grep -v "^?? $scratch_rel/" | shasum | cut -c1-40)"
   review_tools="--tools Read,Grep,Glob,Bash --disallowedTools Edit,Write,MultiEdit,NotebookEdit \
 --settings '{\"disableAllHooks\": true}' --strict-mcp-config --mcp-config '$work/mcp-empty.json' \
---max-budget-usd $REVIEW_BUDGET_USD --output-format json --permission-mode acceptEdits"
+--max-budget-usd $REVIEW_BUDGET_USD --output-format json --permission-mode acceptEdits${REVIEW_MODEL:+ --model $REVIEW_MODEL}"
   default_reviewer="claude -p $review_tools --allowedTools 'Read,Grep,Glob,Bash(git diff*),Bash(git log*),Bash(git show*),Bash(cat *),Bash(ls*)' --json-schema '$(cat "$ORC_ROOT/prompts/review-reviewer.schema.json")'"
   default_challenger="claude -p $review_tools --allowedTools 'Read,Grep,Glob,Bash' --json-schema '$(cat "$ORC_ROOT/prompts/review-challenger.schema.json")'"
   review_call() {  # <role> <cmd> <prompt-file> → JSON findings в stdout, лог в review/<role>.log

@@ -1,6 +1,7 @@
 # Сервер дашборда: статика + два действия. Имена латиницей — см. scripts/run-bats.sh.
 
 setup() {
+  export ORC_GEN_CMD="${ORC_GEN_CMD:-false}" ORC_REVIEW_CMD="false" ORC_CHALLENGE_CMD="false"
   ORC_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
   TMP="$(mktemp -d)"
   export ORC_STATE="$TMP/state"
@@ -35,6 +36,7 @@ PUSH_OPTS=""
 MR_DIR="$TMP/mr"
 QUEUE_FILE="$QUEUE"
 DEADLINE_SEC="20"
+REVIEW_TRACKS=""
 EOC
 
   command -v curl >/dev/null || skip "нет curl"

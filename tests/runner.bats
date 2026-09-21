@@ -4,6 +4,9 @@ setup() {
   ORC_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
   TMP="$(mktemp -d)"
   export ORC_STATE="$TMP/state"
+  # Предохранитель: тест без явной подмены роняет прогон, а не зовёт настоящий claude.
+  # 21.09: фаза review без подмены сделала 25 живых вызовов на ~$5 из-под bats.
+  export ORC_GEN_CMD="false" ORC_REVIEW_CMD="false" ORC_CHALLENGE_CMD="false"
 
   # цель: bare с защищённым main и одним коммитом в нём
   "$ORC_ROOT/scripts/make-remote.sh" "$TMP/target.git" main >/dev/null
@@ -34,6 +37,7 @@ PUSH_OPTS=""
 MR_DIR="$TMP/mr"
 QUEUE_FILE="$QUEUE"
 DEADLINE_SEC="20"
+REVIEW_TRACKS=""
 EOF
 }
 
@@ -240,6 +244,7 @@ GEN
 }
 
 @test "review_runs_by_default_and_attaches_table_to_mr" {
+  sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="A B"|' "$CONF"
   fake_review "$TMP/rev.sh" '{"verdict":"ok","findings":[]}' "touch $TMP/reviewed"
   fake_review "$TMP/ch.sh" '{"findings":[],"extra":[]}' "touch $TMP/challenged"
   run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \
@@ -253,6 +258,7 @@ GEN
 }
 
 @test "review_is_skipped_for_track_c" {
+  sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="A B"|' "$CONF"
   jq -c '.track = "C"' "$QUEUE" > "$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
   fake_review "$TMP/rev.sh" '{"verdict":"ok","findings":[]}' "touch $TMP/reviewed"
   run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/rev.sh" \
@@ -263,6 +269,7 @@ GEN
 }
 
 @test "review_confirmed_p1_blocks_before_push" {
+  sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="A B"|' "$CONF"
   fake_review "$TMP/rev.sh" '{"verdict":"findings","findings":[{"id":"r1","severity":"P1","ac":"CT-1","place":"file.txt:1","scenario":"строка не та"}]}'
   fake_review "$TMP/ch.sh" '{"findings":[{"id":"r1","verdict":"confirmed","evidence":"grep подтвердил"}],"extra":[]}'
   run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \
@@ -278,6 +285,7 @@ GEN
 }
 
 @test "review_refuted_p1_goes_to_mr_with_table" {
+  sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="A B"|' "$CONF"
   fake_review "$TMP/rev.sh" '{"verdict":"findings","findings":[{"id":"r1","severity":"P1","ac":"CT-1","place":"file.txt:1","scenario":"строка не та"}]}'
   fake_review "$TMP/ch.sh" '{"findings":[{"id":"r1","verdict":"refuted","evidence":"строка на месте, cat показал"}],"extra":[{"id":"c1","severity":"P3","place":"file.txt:1","scenario":"нет перевода строки"}]}'
   run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \
@@ -289,6 +297,7 @@ GEN
 }
 
 @test "review_that_modifies_tree_is_refused" {
+  sed -i '' 's|REVIEW_TRACKS=""|REVIEW_TRACKS="A B"|' "$CONF"
   fake_review "$TMP/rev.sh" '{"verdict":"ok","findings":[]}' "printf x > extra.txt"
   fake_review "$TMP/ch.sh" '{"findings":[],"extra":[]}'
   run env ORC_GEN_CMD="sh -c 'printf сделано >> file.txt'" ORC_REVIEW_CMD="$TMP/rev.sh" ORC_CHALLENGE_CMD="$TMP/ch.sh" \

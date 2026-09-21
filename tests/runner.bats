@@ -537,6 +537,7 @@ EOF
 # SessionEnd-хука целевого репозитория внутри задачи. Гасим их флагом, но НЕ через
 # --setting-sources: тот унёс бы вместе с настройками и CLAUDE.md репозитория.
 @test "runner_disables_instance_hooks_in_generator_call" {
+  unset ORC_GEN_CMD  # тест смотрит на дефолтную команду через подставной claude в PATH
   bin="$TMP/bin"; mkdir -p "$bin"
   # стаб перехватывает аргументы: настоящий claude в тестах не запускается
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" > "%s/claude-args.txt"\nprintf "{}"\n' \
@@ -555,6 +556,7 @@ EOF
 # прогон 25.08 потерял готовую правку из-за строки, дописанной в буфер наблюдений
 # по правилу проекта. Границы прогона дописываются к каждой задаче.
 @test "runner_appends_process_boundaries_to_prompt" {
+  unset ORC_GEN_CMD  # тест смотрит на дефолтную команду через подставной claude в PATH
   bin="$TMP/bin"; mkdir -p "$bin"
   # стаб сохраняет полученный промпт: он приходит генератору на stdin
   printf '#!/usr/bin/env bash\ncat > "%s/prompt-seen.txt"\nprintf "{}"\n' "$TMP" > "$bin/claude"
@@ -662,6 +664,7 @@ EOC
 }
 
 @test "runner_passes_strict_mcp_config_to_generator" {
+  unset ORC_GEN_CMD  # тест смотрит на дефолтную команду через подставной claude в PATH
   bin="$TMP/bin"; mkdir -p "$bin"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" > "%s/claude-args.txt"\nprintf "{}"\n' "$TMP" > "$bin/claude"
   chmod +x "$bin/claude"

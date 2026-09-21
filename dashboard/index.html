@@ -90,6 +90,7 @@ const WHY_SUBTYPE = s => s === 'error_max_budget_usd' ? 'бюджет исчер
 const stClass = s => ({done:'done', blocked:'blocked', running:'running'}[s] || (/fail|violation/.test(s) ? 'failed' : ''));
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt$ = v => v == null ? '—' : '$' + Number(v).toFixed(2);
+const fmtK = n => n >= 1000 ? Math.round(n / 1000) + ' тыс.' : String(n);
 const fmtS = ms => ms == null ? '—' : (ms >= 1000 ? Math.round(ms/1000) + ' с' : ms + ' мс');
 
 async function text(url) {
@@ -280,7 +281,7 @@ function render(tasks, runs) {
       ${r.outcome === 'done' ? `<a href="/mr/${encodeURIComponent(r.task.id)}.md">MR</a>` : ''}
       <a href="/state/logs/${encodeURIComponent(r.task.id)}/events.jsonl">jsonl</a></header>`,
       bar: `<div class="bar" role="img" aria-label="фазы: ${esc(barLabel)}">${bar}</div><div class="legend">${legend}</div>`,
-      steps: r.steps && r.steps.total ? `<div class="steps"><b>вызовов тулов: ${r.steps.total}</b>${r.steps.done ? '' : ' · идёт'} · ${r.steps.last.slice(-4).map(st => `<code>${esc(st.tool)}</code> ${esc(shortTarget(st.target))}`).join(' · ')}</div>` : '',
+      steps: r.steps && r.steps.total ? `<div class="steps"><b>вызовов тулов: ${r.steps.total}</b>${r.steps.done ? '' : ' · идёт'}${r.steps.usage && r.steps.usage.turns ? ` · ходов ${r.steps.usage.turns} · токены на вход ${fmtK(r.steps.usage.input + r.steps.usage.cache_write)} + кэш ${fmtK(r.steps.usage.cache_read)}` : ''} · ${r.steps.last.slice(-4).map(st => `<code>${esc(st.tool)}</code> ${esc(shortTarget(st.target))}`).join(' · ')}</div>${r.steps.repeat ? `<div class="steps why">⚠ ${r.steps.repeat.n} одинаковых вызовов подряд: <code>${esc(r.steps.repeat.tool)}</code> ${esc(shortTarget(r.steps.repeat.target))} — похоже на цикл</div>` : ''}` : '',
       q: r.question ? `<div class="q"><b>Нужен ответ:</b> ${md(r.question.trim().slice(0, 1500))}</div>` : '',
       notes: r.notes ? `<details class="notes"><summary>заметки бота (${r.notes.trim().split('\n').filter(Boolean).length})</summary><div class="q notes">${md(r.notes.trim().slice(0, 1500))}</div></details>` : ''
     }};

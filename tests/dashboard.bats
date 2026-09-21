@@ -131,3 +131,25 @@ post() {  # $1 action, $2 id, $3 extra curl args
   run curl -s "http://127.0.0.1:$PORT/state/logs/nope/steps.json"
   [ "$(printf '%s' "$output" | jq -r '.total')" = "0" ]
 }
+
+@test "steps_endpoint_sums_usage_once_per_message_and_flags_repeated_calls" {
+  mkdir -p "$ORC_STATE/logs/t10/stdout"
+  {
+    # один message.id в двух строках — параллельные блоки одного хода, usage считается один раз
+    printf '%s\n' '{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"output_tokens":7},"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/x/repo/a.md"}}]}}'
+    printf '%s\n' '{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":50,"output_tokens":7},"content":[{"type":"text","text":"ok"}]}}'
+    for i in 1 2 3 4 5; do
+      printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"id\":\"m$((i+1))\",\"usage\":{\"input_tokens\":1,\"cache_read_input_tokens\":10},\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"bash scripts/lint-all.sh\"}}]}}"
+    done
+  } > "$ORC_STATE/logs/t10/stdout/implement.log"
+  run curl -s "http://127.0.0.1:$PORT/state/logs/t10/steps.json"
+  [ "$(printf '%s' "$output" | jq -r '.usage.turns')" = "6" ]
+  [ "$(printf '%s' "$output" | jq -r '.usage.cache_write')" = "100" ]
+  [ "$(printf '%s' "$output" | jq -r '.usage.cache_read')" = "100" ]
+  [ "$(printf '%s' "$output" | jq -r '.repeat.n')" = "5" ]
+  [ "$(printf '%s' "$output" | jq -r '.repeat.tool')" = "Bash" ]
+  # четыре подряд — ещё не цикл
+  head -n 5 "$ORC_STATE/logs/t10/stdout/implement.log" > "$ORC_STATE/logs/t10/stdout/tmp" && mv "$ORC_STATE/logs/t10/stdout/tmp" "$ORC_STATE/logs/t10/stdout/implement.log"
+  run curl -s "http://127.0.0.1:$PORT/state/logs/t10/steps.json"
+  [ "$(printf '%s' "$output" | jq -r '.repeat')" = "null" ]
+}

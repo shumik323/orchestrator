@@ -63,6 +63,13 @@ class Handler(SimpleHTTPRequestHandler):
     def steps(self, tid):
         path = os.path.join(STATE, "logs", tid, "stdout", "implement.log")
         steps, done = [], False
+        # Расход по ходу: usage лежит в каждой assistant-строке, но один message.id повторяется в
+        # нескольких строках (параллельные блоки), а output_tokens там заглушка — считаем вход и кэш
+        # один раз на id, выход не считаем (нижняя оценка). Итоговая цена приходит только в result.
+        seen, usage = set(), {"turns": 0, "input": 0, "cache_write": 0, "cache_read": 0}
+        # Цикл линта: бот повторяет один и тот же вызов с теми же аргументами. Пять подряд — сигнал
+        # владельцу до того, как бюджет кончится (faqs 20.09: 18 ходов в lint-all до $2.50).
+        prev_key, run_n, worst = None, 0, {"n": 0, "tool": "", "target": ""}
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -73,16 +80,32 @@ class Handler(SimpleHTTPRequestHandler):
                     except ValueError:
                         continue
                     if ev.get("type") == "assistant":
-                        for block in (ev.get("message") or {}).get("content") or []:
+                        msg = ev.get("message") or {}
+                        mid = msg.get("id")
+                        if mid and mid not in seen:
+                            seen.add(mid)
+                            u = msg.get("usage") or {}
+                            usage["turns"] += 1
+                            usage["input"] += int(u.get("input_tokens") or 0)
+                            usage["cache_write"] += int(u.get("cache_creation_input_tokens") or 0)
+                            usage["cache_read"] += int(u.get("cache_read_input_tokens") or 0)
+                        for block in msg.get("content") or []:
                             if block.get("type") == "tool_use":
                                 inp = block.get("input") or {}
                                 target = inp.get("file_path") or inp.get("command") or inp.get("pattern") or inp.get("description") or ""
-                                steps.append({"tool": block.get("name", "?"), "target": str(target)[:160]})
+                                step = {"tool": block.get("name", "?"), "target": str(target)[:160]}
+                                steps.append(step)
+                                key = (step["tool"], json.dumps(inp, sort_keys=True, ensure_ascii=False))
+                                run_n = run_n + 1 if key == prev_key else 1
+                                prev_key = key
+                                if run_n > worst["n"]:
+                                    worst = {"n": run_n, "tool": step["tool"], "target": step["target"]}
                     elif ev.get("type") == "result":
                         done = True
         except OSError:
             pass  # лога ещё нет (фаза клона) или генератор старого формата — пустой список, не ошибка
-        return self._json(200, {"total": len(steps), "done": done, "last": steps[-8:]})
+        return self._json(200, {"total": len(steps), "done": done, "last": steps[-8:], "usage": usage,
+                                "repeat": worst if worst["n"] >= 5 else None})
 
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
